@@ -33,6 +33,22 @@ function extractBearerToken(metadata: grpc.Metadata): string | undefined {
   return /^Bearer\s+(.+)$/i.exec(value)?.[1];
 }
 
+// lore-server's repository_list/repository_authorizer (lore-server/src/authnz/
+// repository_authorizer.rs, lore-server/src/grpc/handlers/repository_list.rs) expect
+// resource_id values formatted "urc-<repository id>" — Clerk metadata only stores the
+// bare partition, so the prefix is added here rather than asking every admin to know it.
+function toResourceId(partition: string): string {
+  return `urc-${partition}`;
+}
+
+// loreserver's own authorization checks (repository_authorizer.rs) do a plain exact
+// string match on whatever resource_id we hand back — it has no wildcard logic itself.
+// A partition of "*" is our own convention for "every repository"; resolving it to the
+// specific resource_id being asked about happens here, not on loreserver's side.
+function matchesResource(partition: string, resourceId: string): boolean {
+  return partition === "*" || toResourceId(partition) === resourceId;
+}
+
 function healthCheck(
   _call: grpc.ServerUnaryCall<Record<string, never>, { status: string }>,
   callback: grpc.sendUnaryData<{ status: string }>
@@ -100,15 +116,47 @@ async function lookupUserPermissions(
 
   try {
     const { resources } = await verifyLoreToken(token);
+    // repository_list.rs calls this with resource_filter: "urc" — a category, not a
+    // specific resource — asking for every repository the token grants. Only treat the
+    // filter as a single-resource lookup when it's an actual "urc-..." resource_id.
     const filter = call.request.resource_filter;
-    const filtered = filter ? resources.filter((r) => r.partition === filter) : resources;
+    const filtered = filter && filter !== "urc" ? resources.filter((r) => matchesResource(r.partition, filter)) : resources;
 
     callback(null, {
+      // A wildcard match must echo back the specific resource_id that was asked about,
+      // not the literal "urc-*" — the caller is checking for an exact match on its own ask.
       resource_permission: filtered.map((r) => ({
-        resource_id: r.partition,
+        resource_id: r.partition === "*" && filter && filter !== "urc" ? filter : toResourceId(r.partition),
         permission: r.permissions,
       })),
     });
+  } catch (err) {
+    callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
+  }
+}
+
+async function checkUserPermission(
+  call: grpc.ServerUnaryCall<{ resource_id: string[] }, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callback: grpc.sendUnaryData<any>
+): Promise<void> {
+  const token = extractBearerToken(call.metadata);
+  if (!token) {
+    callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
+    return;
+  }
+
+  try {
+    const { resources } = await verifyLoreToken(token);
+
+    const allowed: { resource_id: string; permission: string[] }[] = [];
+    const denied: { resource_id: string; permission: string[] }[] = [];
+    for (const resourceId of call.request.resource_id ?? []) {
+      const match = resources.find((r) => matchesResource(r.partition, resourceId));
+      (match ? allowed : denied).push({ resource_id: resourceId, permission: match?.permissions ?? [] });
+    }
+
+    callback(null, { allowed_resource_permission: allowed, denied_resource_permission: denied });
   } catch (err) {
     callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
   }
@@ -121,6 +169,7 @@ export function createGrpcServer(): grpc.Server {
     StartAuthSession: startAuthSession,
     GetAuthSession: getAuthSession,
     LookupUserPermissions: lookupUserPermissions,
+    CheckUserPermission: checkUserPermission,
   });
   return server;
 }
