@@ -88,6 +88,7 @@ CLERK_PUBLISHABLE_KEY=pk_live_...
 CLERK_ACCOUNT_PORTAL_URL=https://accounts.yourcompany.com
 PUBLIC_HTTP_BASE_URL=https://lore-auth.yourcompany.com
 LORE_SERVER_HOSTNAME=your-lore-server.up.railway.app
+LORE_SERVER_ENV=local
 SIGNING_KEY_PEM=<output of: openssl genrsa 2048 | openssl pkcs8 -topk8 -nocrypt>
 PORT=8080
 GRPC_PORT=50051
@@ -172,6 +173,7 @@ in the terminal.
 | `CLERK_ACCOUNT_PORTAL_URL` | Bridge | Clerk Dashboard → Account Portal, no trailing slash |
 | `PUBLIC_HTTP_BASE_URL` | Bridge | This service's own public URL, **with `https://` scheme**. Also used as the `iss` claim on minted tokens — must match `LORE__SERVER__AUTH__JWT_ISSUER` on the Lore server exactly |
 | `LORE_SERVER_HOSTNAME` | Bridge | Bare hostname (no scheme, no port) of your Lore server. Used as the `aud` claim — must exactly match the host you pass to `lore auth login`, or the CLI rejects the token locally |
+| `LORE_SERVER_ENV` | Bridge | Must match the Lore server's own `--env`/`LORE_ENV` (default `local`). Required on the JWT — loreserver's `AuthorizationToken` struct fails to decode the token at all without it, independently of anything this bridge validates |
 | `SIGNING_KEY_PEM` | Bridge | RSA private key (PKCS8 PEM) for signing tokens. Must stay stable across restarts — an ephemeral key (the fallback if unset) invalidates all outstanding tokens on every redeploy |
 | `PORT` | Bridge | Express's port, routed to by Railway's HTTP-domain feature. Default `8080` |
 | `GRPC_PORT` | Bridge | `grpc-js`'s port, loopback-only — only Caddy talks to it. Default `50051` |
@@ -220,6 +222,23 @@ filename instead of a URL to open.
 
 **`JWT 'aud' does not specify remote domain '...'`.** `LORE_SERVER_HOSTNAME` doesn't exactly match
 the host you passed to `lore auth login`. It needs to be the bare hostname — no scheme, no port.
+
+**Lore server logs `Unexpected error decoding JWT AuthN token ... missing field '<name>'`, and
+`lore repository list` (or similar) fails with a permission-denied-flavored error even though
+`lore auth login` succeeded.** The Lore server's own `AuthorizationToken` struct requires several
+claims beyond the JWT standard ones: `env`, `preferred_username`, and `idp`. `LORE_SERVER_ENV`
+covers `env`; the bridge sets `preferred_username` and `idp` itself. If this shows up again after
+a Lore server upgrade, check `lore-server/src/auth/jwt.rs`'s `AuthorizationToken` struct for a new
+required field — this fails token decoding entirely, before repository authorization is ever
+reached, so it can look identical to a permissions problem even though it's unrelated.
+
+**Caddy's certificate cache resets on every deploy / Let's Encrypt rate limit
+(`too many certificates ... already issued for this exact set of identifiers`).** Railway's
+container filesystem is ephemeral across deploys. Attach a Railway Volume to the bridge service at
+mount path `/data` (via the Command Palette or right-click on the project canvas — not under
+Settings) so Caddy's cert cache (`XDG_DATA_HOME=/data`, set in the Dockerfile) survives redeploys.
+If you're already rate-limited, either wait out the 7-day window or temporarily point `GRPC_DOMAIN`
+at a fresh subdomain — Let's Encrypt's limit is keyed to the exact set of domain names in the cert.
 
 ## Local development
 

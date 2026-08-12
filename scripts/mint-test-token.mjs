@@ -7,6 +7,7 @@ const { token, expiresAt } = await signLoreToken({
   audience: process.env.TEST_AUD ?? "lore-service",
   resources: [{ partition: "test-partition-id", permissions: ["read", "write"] }],
   ttlSeconds: 3600,
+  env: process.env.TEST_ENV ?? "local",
 });
 console.log(token);
 console.error("expiresAt", expiresAt);

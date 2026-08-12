@@ -104,6 +104,10 @@ export function createHttpApp(): Express {
         // testing against the real `lore` binary: an arbitrary audience value fails
         // with "JWT 'aud' does not specify remote domain '<host>'".
         audience: requireEnv("LORE_SERVER_HOSTNAME"),
+        // Must match the Lore server's own --env / LORE_ENV (default "local") — it's a
+        // required claim on the JWT that loreserver decodes independently of anything
+        // this bridge checks, and a mismatch there isn't something this bridge can see.
+        env: requireEnv("LORE_SERVER_ENV"),
         resources,
       });
       completeSession(sessionCode, { userToken: loreToken, expiresAt, userId, userName });

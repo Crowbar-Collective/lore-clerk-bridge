@@ -110,6 +110,7 @@ async function lookupUserPermissions(
 ): Promise<void> {
   const token = extractBearerToken(call.metadata);
   if (!token) {
+    console.warn("LookupUserPermissions: no bearer token on request");
     callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
     return;
   }
@@ -121,6 +122,9 @@ async function lookupUserPermissions(
     // filter as a single-resource lookup when it's an actual "urc-..." resource_id.
     const filter = call.request.resource_filter;
     const filtered = filter && filter !== "urc" ? resources.filter((r) => matchesResource(r.partition, filter)) : resources;
+    console.log(
+      `LookupUserPermissions: filter=${JSON.stringify(filter)} granted=${JSON.stringify(resources)} matched=${filtered.length}`
+    );
 
     callback(null, {
       // A wildcard match must echo back the specific resource_id that was asked about,
@@ -131,6 +135,7 @@ async function lookupUserPermissions(
       })),
     });
   } catch (err) {
+    console.warn("LookupUserPermissions: token verification failed:", err);
     callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
   }
 }
@@ -142,6 +147,7 @@ async function checkUserPermission(
 ): Promise<void> {
   const token = extractBearerToken(call.metadata);
   if (!token) {
+    console.warn("CheckUserPermission: no bearer token on request");
     callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
     return;
   }
@@ -155,9 +161,13 @@ async function checkUserPermission(
       const match = resources.find((r) => matchesResource(r.partition, resourceId));
       (match ? allowed : denied).push({ resource_id: resourceId, permission: match?.permissions ?? [] });
     }
+    console.log(
+      `CheckUserPermission: requested=${JSON.stringify(call.request.resource_id)} allowed=${allowed.length} denied=${denied.length}`
+    );
 
     callback(null, { allowed_resource_permission: allowed, denied_resource_permission: denied });
   } catch (err) {
+    console.warn("CheckUserPermission: token verification failed:", err);
     callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
   }
 }

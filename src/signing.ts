@@ -62,6 +62,8 @@ export async function signLoreToken(params: {
   audience?: string;
   resources: ResourceGrant[];
   ttlSeconds?: number;
+  env: string;
+  idp?: string;
 }): Promise<{ token: string; expiresAt: number }> {
   const { privateKey, kid } = await loadSigningKeys();
   const ttlSeconds = params.ttlSeconds ?? 3600;
@@ -71,9 +73,17 @@ export async function signLoreToken(params: {
   // The `lore` CLI's local token decode (lore-revision/src/auth/login.rs) requires
   // `aud` to be structurally present, even though loreserver itself only validates it
   // when jwt_audience is configured server-side (which we're deliberately leaving unset).
+  //
+  // env, preferred_username, and idp are required (non-Option) fields on loreserver's
+  // own AuthorizationToken struct (lore-server/src/auth/jwt.rs) — omitting any of them
+  // fails JWT decoding server-side with "missing field '<name>'" before repository
+  // authorization is ever reached. Confirmed against the real loreserver's auth logs.
   const token = await new SignJWT({
     resources: params.resources,
     name: params.userName,
+    preferred_username: params.userName,
+    env: params.env,
+    idp: params.idp ?? "clerk",
   })
     .setProtectedHeader({ alg: "RS256", kid })
     .setIssuer(params.issuer)
