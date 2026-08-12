@@ -14,9 +14,10 @@ export interface ClerkUserGrant {
   resources: ResourceGrant[];
 }
 
-// The bridge is Clerk's registered primary domain (see plan), so a session token
-// minted on /callback verifies directly against our own secret key — no satellite
-// domain / cross-origin session juggling needed.
+// The bridge is deployed on a subdomain of Clerk's primary domain (not on Clerk's
+// satellite-domain feature, which needs a paid plan), so its session cookie arrives
+// here automatically. This check itself is unaffected either way: it's a direct
+// secretKey verification, independent of which domain issued the token.
 export async function verifyClerkSessionAndGetGrants(sessionToken: string): Promise<ClerkUserGrant> {
   const claims = await verifyToken(sessionToken, { secretKey });
   const userId = claims.sub;

@@ -1,0 +1,15 @@
+{
+	admin off
+}
+
+{$GRPC_DOMAIN}:{$CADDY_GRPC_PORT} {
+	tls {
+		dns acmedns {
+			username {$ACMEDNS_USERNAME}
+			password {$ACMEDNS_PASSWORD}
+			subdomain {$ACMEDNS_SUBDOMAIN}
+			server_url {$ACMEDNS_SERVER_URL}
+		}
+	}
+	reverse_proxy h2c://127.0.0.1:{$GRPC_PORT}
+}

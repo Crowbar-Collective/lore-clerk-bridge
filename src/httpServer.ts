@@ -24,6 +24,9 @@ function renderCallbackPage(sessionCode: string, publishableKey: string): string
   const statusEl = document.getElementById("status");
   window.addEventListener("load", async () => {
     try {
+      // No satellite config needed: this page must be served from a subdomain of
+      // Clerk's primary domain (devops.crowbargames.com), so the browser already
+      // hands Clerk's session cookie to this origin automatically.
       await window.Clerk.load();
       if (!window.Clerk.session) {
         statusEl.textContent = "No active session detected — please retry lore auth login.";

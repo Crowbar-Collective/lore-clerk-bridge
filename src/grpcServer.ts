@@ -127,12 +127,16 @@ export function createGrpcServer(): grpc.Server {
 
 export function startGrpcServer(port: number): grpc.Server {
   const server = createGrpcServer();
-  server.bindAsync(`0.0.0.0:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
+  // Loopback-only: Caddy (see Caddyfile) is the actual public listener, terminating
+  // TLS and forwarding over local h2c. Railway's TCP Proxy has no TLS of its own, and
+  // its HTTP-domain edge downgrades to HTTP/1.1 before the container, which a native
+  // HTTP/2-only gRPC server can't speak — so nothing but Caddy should reach this port.
+  server.bindAsync(`127.0.0.1:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
     if (err) {
       console.error("Failed to bind gRPC server:", err);
       process.exit(1);
     }
-    console.log(`UrcAuthApi gRPC server listening on 0.0.0.0:${boundPort}`);
+    console.log(`UrcAuthApi gRPC server listening on 127.0.0.1:${boundPort}`);
   });
   return server;
 }
