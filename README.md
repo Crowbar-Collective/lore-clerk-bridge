@@ -239,6 +239,21 @@ filename instead of a URL to open.
 **`JWT 'aud' does not specify remote domain '...'`.** `LORE_SERVER_HOSTNAME` doesn't exactly match
 the host you passed to `lore auth login`. It needs to be the bare hostname — no scheme, no port.
 
+**A change to token claims doesn't take effect — old behavior persists even after
+`lore auth login`.** The client caches tokens on disk in `tokens.toml` (under the per-user local
+config dir — e.g. `%LOCALAPPDATA%\Epic Games\lore\config\` on Windows — or wherever `LORE_AUTH_PATH`
+points). Crucially, **repository-scoped authz tokens are keyed `{auth_url}/{repository_id}`**, so
+`lore auth logout` against the *server* URL doesn't clear them, and `login` only refreshes the
+authn token. A still-valid cached authz token is reused without ever calling the auth service
+(`lore-transport/src/auth/exchange.rs` returns early on a cache hit), so the bridge sees no request
+at all. To force a clean exchange, either delete `tokens.toml` or point the store somewhere fresh:
+
+```
+$env:LORE_AUTH_PATH = "C:\some\empty\dir"
+```
+
+This only matters when token *contents* change — a normal deployment never hits it.
+
 **Everything authenticates, but repository content operations fail with `Unauthorized` /
 `The caller does not have permission to execute the specified operation`, with nothing useful in
 the Lore server logs.** The JWT's `resources` claim must use loreserver's own field names —
