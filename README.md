@@ -17,7 +17,15 @@ There are two independent flows:
    for their granted resources, and mints a Lore-compatible JWT.
 2. **CLI polling** (gRPC): the `lore` CLI calls `StartAuthSession` to get the `login_url` above and
    a `session_code`, opens the browser, then polls `GetAuthSession` until the token from step 1
-   shows up. `LookupUserPermissions` is used afterward to check what a token grants.
+   shows up. `LookupUserPermissions`/`CheckUserPermission` are used afterward by the Lore server
+   itself (not the CLI directly) to authorize repository operations against the token's claims.
+3. **Repository creation** (gRPC, `ucs.auth.RebacApi`): when a user creates a new repository, the
+   Lore server calls back into a *different* gRPC service — `RebacApi.CreateResource`, not
+   `UrcAuthApi` — to register them as its owner. Since Clerk's `publicMetadata` is the only place
+   resource grants live here, "creating a resource" means appending an entry to the creating user's
+   own metadata. This is what makes newly created repositories show up in `lore repository list`
+   automatically going forward, without manually editing Clerk metadata each time — that manual
+   step is only needed for granting access to repositories someone *else* created.
 
 Both flows are implemented in one service (`src/httpServer.ts` and `src/grpcServer.ts`), but they
 have very different networking requirements, which is the main source of complexity here — see
@@ -223,6 +231,12 @@ filename instead of a URL to open.
 
 **`JWT 'aud' does not specify remote domain '...'`.** `LORE_SERVER_HOSTNAME` doesn't exactly match
 the host you passed to `lore auth login`. It needs to be the bare hostname — no scheme, no port.
+
+**`lore repository create` fails with `The server does not implement the method
+/ucs.auth.RebacApi/CreateResource`.** The Lore server calls a second gRPC service (`ucs.auth.RebacApi`,
+vendored as `proto/rebac_api.proto`) on repository creation/deletion, separate from `UrcAuthApi`. The
+bridge implements both `CreateResource` and `DeleteResource` on the same server/port — if you see
+this, the deployed build predates that, or the proto didn't get copied into the Docker image.
 
 **Lore server logs `Unexpected error decoding JWT AuthN token ... Error(InvalidAudience)`.**
 The Lore server has `[server.auth] jwt_audience` configured (check its `bucket.toml`/`local.toml`/

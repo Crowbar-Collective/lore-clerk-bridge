@@ -4,11 +4,13 @@ import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import { createSession, getSession } from "./sessionStore.js";
 import { verifyLoreToken } from "./signing.js";
+import { grantResource, revokeResource } from "./clerk.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROTO_PATH = path.join(__dirname, "..", "proto", "auth_api.proto");
+const REBAC_PROTO_PATH = path.join(__dirname, "..", "proto", "rebac_api.proto");
 
-const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+const packageDefinition = protoLoader.loadSync([PROTO_PATH, REBAC_PROTO_PATH], {
   keepCase: true,
   longs: String,
   enums: String,
@@ -19,6 +21,7 @@ const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const proto = grpc.loadPackageDefinition(packageDefinition) as any;
 const urcAuthApiService = proto.epic_urc.UrcAuthApi.service;
+const rebacApiService = proto.ucs.auth.RebacApi.service;
 
 function requirePublicBaseUrl(): string {
   const url = process.env.PUBLIC_HTTP_BASE_URL;
@@ -172,6 +175,67 @@ async function checkUserPermission(
   }
 }
 
+// Called by loreserver when a user creates a new repository (lore-server/src/grpc/
+// handlers/repository_create.rs), to register them as its owner. Clerk's publicMetadata
+// is the only place resource grants live, so "creating" a resource here means appending
+// to the calling user's own metadata — there's no separate authorization database.
+async function createResource(
+  call: grpc.ServerUnaryCall<{ resource_id: string; resource_name: string }, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callback: grpc.sendUnaryData<any>
+): Promise<void> {
+  const token = extractBearerToken(call.metadata);
+  if (!token) {
+    console.warn("CreateResource: no bearer token on request");
+    callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
+    return;
+  }
+
+  try {
+    const { sub: userId } = await verifyLoreToken(token);
+    const partition = call.request.resource_id.replace(/^urc-/, "");
+    const { created } = await grantResource(userId, partition, ["owner"]);
+    console.log(`CreateResource: user=${userId} partition=${partition} created=${created}`);
+    if (!created) {
+      // repository_create.rs explicitly treats AlreadyExists as success, not an error.
+      callback({ code: grpc.status.ALREADY_EXISTS, message: "Resource already exists" });
+      return;
+    }
+    callback(null, {});
+  } catch (err) {
+    console.warn("CreateResource: failed:", err);
+    callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
+  }
+}
+
+// Only revokes the grant from the calling (deleting) user — not from every user who
+// might have been granted this resource, which would need iterating Clerk's whole user
+// base. Acceptable gap for now: stale grants for a deleted repository just point at
+// nothing rather than posing an access risk.
+async function deleteResource(
+  call: grpc.ServerUnaryCall<{ resource_id: string }, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callback: grpc.sendUnaryData<any>
+): Promise<void> {
+  const token = extractBearerToken(call.metadata);
+  if (!token) {
+    console.warn("DeleteResource: no bearer token on request");
+    callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
+    return;
+  }
+
+  try {
+    const { sub: userId } = await verifyLoreToken(token);
+    const partition = call.request.resource_id.replace(/^urc-/, "");
+    await revokeResource(userId, partition);
+    console.log(`DeleteResource: user=${userId} partition=${partition}`);
+    callback(null, {});
+  } catch (err) {
+    console.warn("DeleteResource: failed:", err);
+    callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
+  }
+}
+
 export function createGrpcServer(): grpc.Server {
   const server = new grpc.Server();
   server.addService(urcAuthApiService, {
@@ -180,6 +244,10 @@ export function createGrpcServer(): grpc.Server {
     GetAuthSession: getAuthSession,
     LookupUserPermissions: lookupUserPermissions,
     CheckUserPermission: checkUserPermission,
+  });
+  server.addService(rebacApiService, {
+    CreateResource: createResource,
+    DeleteResource: deleteResource,
   });
   return server;
 }
