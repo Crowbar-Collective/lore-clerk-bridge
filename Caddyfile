@@ -4,12 +4,8 @@
 
 {$GRPC_DOMAIN}:{$CADDY_GRPC_PORT} {
 	tls {
-		dns acmedns {
-			username {$ACMEDNS_USERNAME}
-			password {$ACMEDNS_PASSWORD}
-			subdomain {$ACMEDNS_SUBDOMAIN}
-			server_url {$ACMEDNS_SERVER_URL}
-		}
+		dns cloudflare {$CF_API_TOKEN}
+		resolvers 1.1.1.1
 	}
 	reverse_proxy h2c://127.0.0.1:{$GRPC_PORT}
 }

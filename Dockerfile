@@ -1,8 +1,8 @@
 # Custom Caddy build: the base Caddy image doesn't include DNS-provider plugins, and
-# we need caddy-dns/acmedns specifically so Caddy can complete Let's Encrypt's DNS-01
-# challenge via acme-dns (our DNS provider has no API, so DNS-01 must be delegated).
+# we need caddy-dns/cloudflare specifically so Caddy can complete Let's Encrypt's
+# DNS-01 challenge directly against our Cloudflare zone.
 FROM caddy:2-builder-alpine AS caddy-build
-RUN xcaddy build --with github.com/caddy-dns/acmedns
+RUN xcaddy build --with github.com/caddy-dns/cloudflare
 
 FROM node:20-alpine AS node-build
 WORKDIR /app
