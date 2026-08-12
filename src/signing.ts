@@ -35,6 +35,34 @@ export function loreServerEnv(): string {
   return env;
 }
 
+// The `resources` JWT claim is read directly by loreserver's own interceptor, so it has
+// to use loreserver's field names (lore-server/src/auth/jwt.rs ResourcePermission), not
+// the {partition, permissions} shape Clerk metadata stores. Getting this wrong fails
+// silently and confusingly: the AuthorizationToken decode errors, `if let Ok(..)` in
+// verify_token_internal swallows it, the JWTUserInfo fallback (which has no `resources`
+// field) succeeds instead, and every request is then denied with a bare "Unauthorized"
+// and no decode error in the logs.
+//
+// A "*" partition maps to the literal "urc-*", which loreserver treats natively as a
+// wildcard (ResourcePermission::is_wildcard_resource) — so wildcard grants are enforced
+// server-side here, unlike the LookupUserPermissions path where we expand them ourselves.
+interface WireResourcePermission {
+  resource_id: string;
+  permission: string[];
+}
+
+function toWireResources(resources: ResourceGrant[]): WireResourcePermission[] {
+  return resources.map((r) => ({ resource_id: `urc-${r.partition}`, permission: r.permissions }));
+}
+
+function fromWireResources(claim: unknown): ResourceGrant[] {
+  if (!Array.isArray(claim)) return [];
+  return (claim as WireResourcePermission[]).map((r) => ({
+    partition: (r.resource_id ?? "").replace(/^urc-/, ""),
+    permissions: r.permission ?? [],
+  }));
+}
+
 interface SigningKeys {
   privateKey: KeyLike;
   publicJwk: JWK;
@@ -102,7 +130,7 @@ export async function signLoreToken(params: {
   // fails JWT decoding server-side with "missing field '<name>'" before repository
   // authorization is ever reached. Confirmed against the real loreserver's auth logs.
   const token = await new SignJWT({
-    resources: params.resources,
+    resources: toWireResources(params.resources),
     name: params.userName,
     preferred_username: params.userName,
     env: params.env,
@@ -136,6 +164,7 @@ export async function verifyLoreToken(
   return {
     sub: payload.sub ?? "",
     name: (payload.name as string | undefined) ?? "",
-    resources: (payload.resources as ResourceGrant[] | undefined) ?? [],
+    // Back to the internal {partition, permissions} shape the rest of the bridge uses.
+    resources: fromWireResources(payload.resources),
   };
 }

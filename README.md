@@ -239,6 +239,18 @@ filename instead of a URL to open.
 **`JWT 'aud' does not specify remote domain '...'`.** `LORE_SERVER_HOSTNAME` doesn't exactly match
 the host you passed to `lore auth login`. It needs to be the bare hostname — no scheme, no port.
 
+**Everything authenticates, but repository content operations fail with `Unauthorized` /
+`The caller does not have permission to execute the specified operation`, with nothing useful in
+the Lore server logs.** The JWT's `resources` claim must use loreserver's own field names —
+`{"resource_id": "urc-<id>", "permission": [...]}` — not the `{partition, permissions}` shape
+Clerk metadata stores. The bridge converts between them (`toWireResources`/`fromWireResources` in
+[src/signing.ts](src/signing.ts)). This one fails *silently*: loreserver's `verify_token_internal`
+wraps the `AuthorizationToken` decode in `if let Ok(..)`, so a malformed `resources` claim just
+falls through to the `JWTUserInfo` fallback, which has no `resources` field and yields
+`resources: None` — after which every authorization check denies with a bare "Unauthorized" and no
+decode error is ever logged. Note that `repository list`/`create` keep working in this state,
+because they consult the bridge's `LookupUserPermissions` over gRPC rather than reading the claim.
+
 **`lore repository list`/`create` work, but `clone` (or push/pull) fails repeatedly with
 `authorization header required` / `Get request failed` / `channel closed`, eventually giving up
 with `Repository not found`.** Listing and creating don't need a repository-scoped connection;
