@@ -15,6 +15,26 @@ export interface ResourceGrant {
   permissions: string[];
 }
 
+// Two independent readers, two different required values: the CLI's local check
+// (lore-credential/src/jwt.rs) needs the Lore server's bare hostname present, and
+// loreserver's own [server.auth] jwt_audience check (when configured — confirmed
+// against a real server set to jwt_audience = ["lore-service"]) needs its configured
+// value present. Both go in since aud accepts an array. Shared by every place that
+// mints a token (initial login, and the ExchangeUserTokenForMultiresourceToken re-mint).
+export function loreServerAudience(): string[] {
+  const hostname = process.env.LORE_SERVER_HOSTNAME;
+  if (!hostname) throw new Error("LORE_SERVER_HOSTNAME is required");
+  return [hostname, process.env.LORE_SERVER_JWT_AUDIENCE ?? "lore-service"];
+}
+
+// Must match the Lore server's own --env / LORE_ENV (default "local") — required on the
+// JWT independently of anything this bridge validates.
+export function loreServerEnv(): string {
+  const env = process.env.LORE_SERVER_ENV;
+  if (!env) throw new Error("LORE_SERVER_ENV is required");
+  return env;
+}
+
 interface SigningKeys {
   privateKey: KeyLike;
   publicJwk: JWK;
@@ -109,12 +129,13 @@ export async function getJwks(): Promise<{ keys: JWK[] }> {
 // no round trip back to Clerk needed.
 export async function verifyLoreToken(
   token: string
-): Promise<{ sub: string; resources: ResourceGrant[] }> {
+): Promise<{ sub: string; name: string; resources: ResourceGrant[] }> {
   const { publicJwk } = await loadSigningKeys();
   const publicKey = await importJWK(publicJwk, "RS256");
   const { payload } = await jwtVerify(token, publicKey);
   return {
     sub: payload.sub ?? "",
+    name: (payload.name as string | undefined) ?? "",
     resources: (payload.resources as ResourceGrant[] | undefined) ?? [],
   };
 }

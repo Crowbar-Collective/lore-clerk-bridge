@@ -19,7 +19,14 @@ There are two independent flows:
    a `session_code`, opens the browser, then polls `GetAuthSession` until the token from step 1
    shows up. `LookupUserPermissions`/`CheckUserPermission` are used afterward by the Lore server
    itself (not the CLI directly) to authorize repository operations against the token's claims.
-3. **Repository creation** (gRPC, `ucs.auth.RebacApi`): when a user creates a new repository, the
+3. **Repository-scoped connections** (gRPC, `UrcAuthApi.ExchangeUserTokenForMultiresourceToken`):
+   any operation that connects to a *specific* repository — `clone`, `push`, `pull`, not just
+   listing — has the client exchange its broad login token for one scoped to that repository
+   before it can open storage/revision/lock connections (`lore-transport/src/auth/exchange.rs`).
+   Skipping this RPC doesn't break login or listing, but breaks every operation that actually
+   touches repository content, with a misleading `authorization header required` error that looks
+   like a missing-credential problem rather than a missing-RPC one.
+4. **Repository creation** (gRPC, `ucs.auth.RebacApi`): when a user creates a new repository, the
    Lore server calls back into a *different* gRPC service — `RebacApi.CreateResource`, not
    `UrcAuthApi` — to register them as its owner. Since Clerk's `publicMetadata` is the only place
    resource grants live here, "creating a resource" means appending an entry to the creating user's
@@ -231,6 +238,15 @@ filename instead of a URL to open.
 
 **`JWT 'aud' does not specify remote domain '...'`.** `LORE_SERVER_HOSTNAME` doesn't exactly match
 the host you passed to `lore auth login`. It needs to be the bare hostname — no scheme, no port.
+
+**`lore repository list`/`create` work, but `clone` (or push/pull) fails repeatedly with
+`authorization header required` / `Get request failed` / `channel closed`, eventually giving up
+with `Repository not found`.** Listing and creating don't need a repository-scoped connection;
+clone/push/pull do, via `ExchangeUserTokenForMultiresourceToken` (see
+[architecture](#how-it-works) above). If this RPC isn't implemented, the client's token exchange
+fails silently enough that it still attempts the storage connections, just with no valid
+credential attached — the repeated failures and eventual disconnect are a symptom of that, not of
+a literally missing header on your end.
 
 **`lore repository create` fails with `The server does not implement the method
 /ucs.auth.RebacApi/CreateResource`.** The Lore server calls a second gRPC service (`ucs.auth.RebacApi`,

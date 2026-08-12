@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import { createSession, getSession } from "./sessionStore.js";
-import { verifyLoreToken } from "./signing.js";
+import { signLoreToken, verifyLoreToken, loreServerAudience, loreServerEnv } from "./signing.js";
 import { grantResource, revokeResource } from "./clerk.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -175,6 +175,57 @@ async function checkUserPermission(
   }
 }
 
+// Called by the `lore` client (lore-transport/src/auth/exchange.rs) whenever it connects
+// for a specific repository — clone, push, pull all need this, not just the simpler
+// listing/creation calls we implemented first. It exchanges the broad AuthN token from
+// login for one scoped to the requested resource(s), used for the storage/revision/lock
+// connections that operation opens. Our token model doesn't narrow scope on exchange (the
+// original token already carries the full granted resource list) — this mints a fresh
+// token with the same claims after confirming every requested resource is authorized,
+// which is what the client's own verify_jwt_usage_for_remote check on the result expects.
+async function exchangeUserTokenForMultiresourceToken(
+  call: grpc.ServerUnaryCall<{ resource_id: string[] }, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callback: grpc.sendUnaryData<any>
+): Promise<void> {
+  const token = extractBearerToken(call.metadata);
+  if (!token) {
+    console.warn("ExchangeUserTokenForMultiresourceToken: no bearer token on request");
+    callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
+    return;
+  }
+
+  try {
+    const { sub: userId, name: userName, resources } = await verifyLoreToken(token);
+    const requested = call.request.resource_id ?? [];
+    const denied = requested.filter((id) => !resources.some((r) => matchesResource(r.partition, id)));
+    console.log(
+      `ExchangeUserTokenForMultiresourceToken: user=${userId} requested=${JSON.stringify(requested)} denied=${JSON.stringify(denied)}`
+    );
+
+    if (denied.length > 0) {
+      callback({ code: grpc.status.PERMISSION_DENIED, message: `Not authorized for: ${denied.join(", ")}` });
+      return;
+    }
+
+    const { token: loreToken, expiresAt } = await signLoreToken({
+      userId,
+      userName,
+      issuer: requirePublicBaseUrl(),
+      audience: loreServerAudience(),
+      env: loreServerEnv(),
+      resources,
+    });
+
+    callback(null, {
+      token: { user_token: loreToken, expires_at: expiresAt, user_id: userId, user_name: userName },
+    });
+  } catch (err) {
+    console.warn("ExchangeUserTokenForMultiresourceToken: failed:", err);
+    callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
+  }
+}
+
 // Called by loreserver when a user creates a new repository (lore-server/src/grpc/
 // handlers/repository_create.rs), to register them as its owner. Clerk's publicMetadata
 // is the only place resource grants live, so "creating" a resource here means appending
@@ -244,6 +295,7 @@ export function createGrpcServer(): grpc.Server {
     GetAuthSession: getAuthSession,
     LookupUserPermissions: lookupUserPermissions,
     CheckUserPermission: checkUserPermission,
+    ExchangeUserTokenForMultiresourceToken: exchangeUserTokenForMultiresourceToken,
   });
   server.addService(rebacApiService, {
     CreateResource: createResource,

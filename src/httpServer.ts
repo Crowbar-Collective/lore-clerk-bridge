@@ -1,7 +1,7 @@
 import express, { type Express } from "express";
 import { getSession, completeSession } from "./sessionStore.js";
 import { verifyClerkSessionAndGetGrants } from "./clerk.js";
-import { signLoreToken, getJwks } from "./signing.js";
+import { signLoreToken, getJwks, loreServerAudience, loreServerEnv } from "./signing.js";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -98,16 +98,8 @@ export function createHttpApp(): Express {
         userId,
         userName,
         issuer: requireEnv("PUBLIC_HTTP_BASE_URL"),
-        // Two independent readers, two different required values: the CLI's local check
-        // (lore-credential/src/jwt.rs) needs the Lore server's bare hostname present, and
-        // loreserver's own [server.auth] jwt_audience check (when configured — confirmed
-        // against a real server set to jwt_audience = ["lore-service"]) needs its
-        // configured value present. Both go in since aud accepts an array.
-        audience: [requireEnv("LORE_SERVER_HOSTNAME"), process.env.LORE_SERVER_JWT_AUDIENCE ?? "lore-service"],
-        // Must match the Lore server's own --env / LORE_ENV (default "local") — it's a
-        // required claim on the JWT that loreserver decodes independently of anything
-        // this bridge checks, and a mismatch there isn't something this bridge can see.
-        env: requireEnv("LORE_SERVER_ENV"),
+        audience: loreServerAudience(),
+        env: loreServerEnv(),
         resources,
       });
       completeSession(sessionCode, { userToken: loreToken, expiresAt, userId, userName });
