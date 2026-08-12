@@ -98,12 +98,12 @@ export function createHttpApp(): Express {
         userId,
         userName,
         issuer: requireEnv("PUBLIC_HTTP_BASE_URL"),
-        // Must be the Lore server's bare hostname (no scheme/port) — the CLI's local
-        // token check (lore-credential/src/jwt.rs) rejects a token whose iss/aud set
-        // doesn't include the exact domain it's authenticating against. Confirmed by
-        // testing against the real `lore` binary: an arbitrary audience value fails
-        // with "JWT 'aud' does not specify remote domain '<host>'".
-        audience: requireEnv("LORE_SERVER_HOSTNAME"),
+        // Two independent readers, two different required values: the CLI's local check
+        // (lore-credential/src/jwt.rs) needs the Lore server's bare hostname present, and
+        // loreserver's own [server.auth] jwt_audience check (when configured — confirmed
+        // against a real server set to jwt_audience = ["lore-service"]) needs its
+        // configured value present. Both go in since aud accepts an array.
+        audience: [requireEnv("LORE_SERVER_HOSTNAME"), process.env.LORE_SERVER_JWT_AUDIENCE ?? "lore-service"],
         // Must match the Lore server's own --env / LORE_ENV (default "local") — it's a
         // required claim on the JWT that loreserver decodes independently of anything
         // this bridge checks, and a mismatch there isn't something this bridge can see.

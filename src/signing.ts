@@ -59,7 +59,7 @@ export async function signLoreToken(params: {
   userId: string;
   userName: string;
   issuer: string;
-  audience?: string;
+  audience?: string | string[];
   resources: ResourceGrant[];
   ttlSeconds?: number;
   env: string;
@@ -70,9 +70,12 @@ export async function signLoreToken(params: {
   const issuedAt = Math.floor(Date.now() / 1000);
   const expiresAt = issuedAt + ttlSeconds;
 
-  // The `lore` CLI's local token decode (lore-revision/src/auth/login.rs) requires
-  // `aud` to be structurally present, even though loreserver itself only validates it
-  // when jwt_audience is configured server-side (which we're deliberately leaving unset).
+  // aud has two independent, unrelated readers that each need their own value present:
+  // the `lore` CLI's local check (lore-credential/src/jwt.rs) requires it to include the
+  // bare hostname of the Lore server being connected to, while loreserver itself checks
+  // it against its own configured [server.auth] jwt_audience (e.g. "lore-service") when
+  // that's set. `aud` accepts an array, and both sides check for membership rather than
+  // an exact single value, so both are included rather than picking one.
   //
   // env, preferred_username, and idp are required (non-Option) fields on loreserver's
   // own AuthorizationToken struct (lore-server/src/auth/jwt.rs) — omitting any of them

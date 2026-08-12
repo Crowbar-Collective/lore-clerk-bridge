@@ -173,7 +173,8 @@ in the terminal.
 | `CLERK_ACCOUNT_PORTAL_URL` | Bridge | Clerk Dashboard → Account Portal, no trailing slash |
 | `PUBLIC_HTTP_BASE_URL` | Bridge | This service's own public URL, **with `https://` scheme**. Also used as the `iss` claim on minted tokens — must match `LORE__SERVER__AUTH__JWT_ISSUER` on the Lore server exactly |
 | `LORE_SERVER_HOSTNAME` | Bridge | Bare hostname (no scheme, no port) of your Lore server. Used as the `aud` claim — must exactly match the host you pass to `lore auth login`, or the CLI rejects the token locally |
-| `LORE_SERVER_ENV` | Bridge | Must match the Lore server's own `--env`/`LORE_ENV` (default `local`). Required on the JWT — loreserver's `AuthorizationToken` struct fails to decode the token at all without it, independently of anything this bridge validates |
+| `LORE_SERVER_ENV` | Bridge | Must match the Lore server's own `--env`/`LORE_ENV` (default `local`). Required on the JWT — loreserver's `AuthorizationToken` struct fails to decode the token at all without it. Its value doesn't appear to be checked against anything, just required to be present |
+| `LORE_SERVER_JWT_AUDIENCE` | Bridge | Only matters if the Lore server has `[server.auth] jwt_audience` configured — check its config for `LORE__SERVER__AUTH__JWT_AUDIENCE`. When set, this must match one of those values (default `lore-service`); it's carried alongside `LORE_SERVER_HOSTNAME` in `aud` since the CLI and the server each require a different value there |
 | `SIGNING_KEY_PEM` | Bridge | RSA private key (PKCS8 PEM) for signing tokens. Must stay stable across restarts — an ephemeral key (the fallback if unset) invalidates all outstanding tokens on every redeploy |
 | `PORT` | Bridge | Express's port, routed to by Railway's HTTP-domain feature. Default `8080` |
 | `GRPC_PORT` | Bridge | `grpc-js`'s port, loopback-only — only Caddy talks to it. Default `50051` |
@@ -222,6 +223,13 @@ filename instead of a URL to open.
 
 **`JWT 'aud' does not specify remote domain '...'`.** `LORE_SERVER_HOSTNAME` doesn't exactly match
 the host you passed to `lore auth login`. It needs to be the bare hostname — no scheme, no port.
+
+**Lore server logs `Unexpected error decoding JWT AuthN token ... Error(InvalidAudience)`.**
+The Lore server has `[server.auth] jwt_audience` configured (check its `bucket.toml`/`local.toml`/
+`LORE__SERVER__AUTH__JWT_AUDIENCE`) and the token's `aud` doesn't contain any of those values. Set
+`LORE_SERVER_JWT_AUDIENCE` on the bridge to match. This is independent of `LORE_SERVER_HOSTNAME` —
+both end up in `aud` together, since the CLI's own local check and the server's `jwt_audience`
+check each require a different value there.
 
 **Lore server logs `Unexpected error decoding JWT AuthN token ... missing field '<name>'`, and
 `lore repository list` (or similar) fails with a permission-denied-flavored error even though
