@@ -37,6 +37,15 @@ export async function verifyClerkSessionAndGetGrants(sessionToken: string): Prom
   return { userId, userName, resources };
 }
 
+// Current grants for a user, straight from Clerk. The authorization RPCs use this rather
+// than the `resources` claim carried on the caller's token: that claim is a snapshot from
+// login, so a repository created (or a grant added or revoked) afterwards would not be
+// visible until the user logged in again.
+export async function getUserGrants(userId: string): Promise<ResourceGrant[]> {
+  const user = await clerkClient.users.getUser(userId);
+  return (user.publicMetadata?.resources as ResourceGrant[] | undefined) ?? [];
+}
+
 // Backs RebacApi.CreateResource: when a user creates a new repository, loreserver
 // calls back here to register them as its owner (lore-server/src/grpc/handlers/
 // repository_create.rs). This is a read-modify-write against Clerk's metadata, not an

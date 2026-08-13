@@ -34,8 +34,14 @@ There are four flows:
    `UrcAuthApi` — to register them as its owner. Since Clerk's `publicMetadata` is the only place
    resource grants live here, "creating a resource" means appending an entry to the creating user's
    own metadata. This is what makes newly created repositories show up in `lore repository list`
-   automatically going forward, without manually editing Clerk metadata each time — that manual
-   step is only needed for granting access to repositories someone *else* created.
+   automatically, without manually editing Clerk metadata each time — that manual step is only
+   needed for granting access to repositories someone *else* created.
+
+Grants are read from Clerk on every authorization call rather than from the caller's token, so
+adding or revoking access takes effect on the next operation — no re-login, and no waiting for a
+token to expire. The `resources` claim on a token is only a snapshot from the moment it was
+minted; `ExchangeUserTokenForMultiresourceToken` refreshes it, which is what lets a
+just-created repository be cloned in the same session.
 
 All of it runs in one process (`src/httpServer.ts` and `src/grpcServer.ts`), but the HTTP and gRPC
 sides have very different networking requirements, which is the main source of deployment
@@ -83,7 +89,10 @@ has to be a domain you control, under whatever domain Clerk's Account Portal alr
 - A [Lore server](https://github.com/EpicGames/lore) already deployed (this bridge replaces its
   default auth, it doesn't replace the server itself).
 - A [Clerk](https://clerk.com) application, with a **custom primary domain** already verified
-  (Dashboard → Domains) — not Clerk's default `*.accounts.dev` domain.
+  (Dashboard → Domains) — not Clerk's default `*.accounts.dev` domain. Clerk's free Hobby plan
+  covers everything here: custom domains are included, and serving the bridge from a subdomain of
+  the primary domain is what avoids satellite domains, the one paid feature this would otherwise
+  need.
 - Somewhere to run a container, satisfying the networking requirements below.
 - DNS you control for both hostnames. If you use the bundled Caddy, the gRPC hostname's zone must
   be on [Cloudflare](https://cloudflare.com) — or swap the `caddy-dns` plugin in the `Dockerfile`
@@ -196,11 +205,24 @@ In Clerk Dashboard → **Users** → a user → **public metadata**:
 { "resources": [{ "partition": "<repository-id>", "permissions": ["read", "write"] }] }
 ```
 
-`partition` is the 32-hex-character Lore repository ID. `"*"` grants every repository — the Lore
-server understands that natively as a wildcard for content operations, though wildcard-only grants
-can't be enumerated, so `lore repository list` shows only explicitly-granted repositories.
+`partition` is the 32-hex-character Lore repository ID, not its name. `"*"` grants every
+repository — loreserver treats the resulting `urc-*` as a wildcard for content operations, but a
+wildcard can't be enumerated, so `lore repository list` shows only explicitly-granted repositories.
+
+Lore publishes no list of permission values; these are the ones its source actually checks
+(`lore-server/src/grpc/mod.rs`): `read`/`write` are implicit once a resource is granted at all,
+`owner`/`admin` gate repository administration, `obliterate` gates obliterate, and `migrate` gates
+lock administration.
 
 Repositories a user creates themselves are added here automatically (see flow 4 above).
+
+**Size limit.** Clerk caps a user's metadata at **8KB across public, private and unsafe combined**.
+Each grant is roughly 80–110 bytes depending on how many permissions it lists, so a user tops out
+around **70–110 repositories** — fewer if you store anything else in their metadata. A `"*"`
+wildcard grant is one entry regardless of repository count, so it's the way to give someone broad
+access without consuming the budget. Past that ceiling you'd need grants in a real store (DynamoDB,
+Postgres) rather than Clerk metadata. If a write does fail, `RebacApi.CreateResource` reports it as
+`UNAVAILABLE` naming the cap, rather than as an authentication error.
 
 ### 7. Verify
 
@@ -298,42 +320,6 @@ The Lore server has `[server.auth] jwt_audience` configured and the token's `aud
 any of those values. Set `LORE_SERVER_JWT_AUDIENCE` on the bridge to match. This is independent of
 `LORE_SERVER_HOSTNAME` — both end up in `aud` together, since the CLI's own local check and the
 server's `jwt_audience` check each require a different value there.
-
-**Lore server logs `Unexpected error decoding JWT AuthN token ... missing field '<name>'`, and
-requests fail with a permission-denied-flavored error even though `lore auth login` succeeded.**
-The Lore server's `AuthorizationToken` struct requires claims beyond the JWT standard ones: `env`,
-`preferred_username`, and `idp`. `LORE_SERVER_ENV` covers `env`; the bridge sets the other two
-itself. If this reappears after a Lore server upgrade, check
-`lore-server/src/auth/jwt.rs`'s `AuthorizationToken` for a newly required field — this fails token
-decoding entirely, before repository authorization is reached, so it looks like a permissions
-problem even though it's unrelated.
-
-**Everything authenticates, but repository content operations fail with `Unauthorized` /
-`The caller does not have permission to execute the specified operation`, with nothing useful in
-the Lore server logs.** The JWT's `resources` claim must use loreserver's own field names —
-`{"resource_id": "urc-<id>", "permission": [...]}` — not the `{partition, permissions}` shape
-Clerk metadata stores. The bridge converts between them (`toWireResources`/`fromWireResources` in
-[src/signing.ts](src/signing.ts)). This one fails *silently*: loreserver's `verify_token_internal`
-wraps the `AuthorizationToken` decode in `if let Ok(..)`, so a malformed `resources` claim falls
-through to the `JWTUserInfo` fallback, which has no `resources` field and yields `resources: None`
-— after which every authorization check denies with a bare "Unauthorized" and no decode error is
-logged. `repository list`/`create` keep working in this state, because they consult the bridge's
-`LookupUserPermissions` over gRPC rather than reading the claim.
-
-**`lore repository list`/`create` work, but `clone` (or push/pull) fails repeatedly with
-`authorization header required` / `Get request failed` / `channel closed`, eventually giving up
-with `Repository not found`.** Listing and creating don't need a repository-scoped connection;
-clone/push/pull do, via `ExchangeUserTokenForMultiresourceToken` (see
-[architecture](#how-it-works)). If that RPC isn't answered, the token exchange fails quietly enough
-that the client still attempts the storage connections with no valid credential — the repeated
-failures and eventual disconnect are a symptom of that, not of a literally missing header.
-
-**`lore repository create` fails with `The server does not implement the method
-/ucs.auth.RebacApi/CreateResource`.** The Lore server calls a second gRPC service
-(`ucs.auth.RebacApi`, vendored as `proto/rebac_api.proto`) on repository creation and deletion,
-separate from `UrcAuthApi`. The bridge implements both `CreateResource` and `DeleteResource` on the
-same server and port — if you see this, the deployed build predates that, or the proto didn't make
-it into the image.
 
 **A change to token claims doesn't take effect — old behavior persists even after
 `lore auth login`.** The client caches tokens on disk in `tokens.toml` (under the per-user local

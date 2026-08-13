@@ -3,8 +3,14 @@ import { fileURLToPath } from "node:url";
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import { createSession, getSession } from "./sessionStore.js";
-import { signLoreToken, verifyLoreToken, loreServerAudience, loreServerEnv } from "./signing.js";
-import { grantResource, revokeResource } from "./clerk.js";
+import {
+  signLoreToken,
+  verifyLoreToken,
+  loreServerAudience,
+  loreServerEnv,
+  type ResourceGrant,
+} from "./signing.js";
+import { getUserGrants, grantResource, revokeResource } from "./clerk.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROTO_PATH = path.join(__dirname, "..", "proto", "auth_api.proto");
@@ -50,6 +56,64 @@ function toResourceId(partition: string): string {
 // specific resource_id being asked about happens here, not on loreserver's side.
 function matchesResource(partition: string, resourceId: string): boolean {
   return partition === "*" || toResourceId(partition) === resourceId;
+}
+
+class RpcError extends Error {
+  constructor(
+    readonly code: grpc.status,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+// Authenticates the caller from its bearer token, then loads that user's *current* grants
+// from Clerk. Deliberately not `verifyLoreToken(token).resources`: the token's claim is a
+// snapshot from login, so a repository created afterwards (or a grant added or revoked in
+// the Clerk dashboard) would not take effect until the user logged in again.
+//
+// The two failures are reported distinctly on purpose. A Clerk outage surfacing as an
+// empty grant list would read as "you have access to nothing" — a silent, plausible-looking
+// denial — so it returns UNAVAILABLE instead.
+async function callerIdentity(
+  metadata: grpc.Metadata
+): Promise<{ userId: string; userName: string }> {
+  const token = extractBearerToken(metadata);
+  if (!token) {
+    throw new RpcError(grpc.status.UNAUTHENTICATED, "Missing bearer token");
+  }
+
+  try {
+    const claims = await verifyLoreToken(token);
+    return { userId: claims.sub, userName: claims.name };
+  } catch (err) {
+    throw new RpcError(grpc.status.UNAUTHENTICATED, `Invalid token: ${(err as Error).message}`);
+  }
+}
+
+async function callerGrants(
+  metadata: grpc.Metadata
+): Promise<{ userId: string; userName: string; resources: ResourceGrant[] }> {
+  const identity = await callerIdentity(metadata);
+  try {
+    return { ...identity, resources: await getUserGrants(identity.userId) };
+  } catch (err) {
+    throw new RpcError(
+      grpc.status.UNAVAILABLE,
+      `Could not load permissions from Clerk: ${(err as Error).message}`
+    );
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function failRpc(label: string, callback: grpc.sendUnaryData<any>, err: unknown): void {
+  if (err instanceof RpcError) {
+    console.warn(`${label}: ${err.message}`);
+    callback({ code: err.code, message: err.message });
+    return;
+  }
+  console.error(`${label}: unexpected failure:`, err);
+  callback({ code: grpc.status.INTERNAL, message: (err as Error).message });
 }
 
 function healthCheck(
@@ -111,15 +175,8 @@ async function lookupUserPermissions(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   callback: grpc.sendUnaryData<any>
 ): Promise<void> {
-  const token = extractBearerToken(call.metadata);
-  if (!token) {
-    console.warn("LookupUserPermissions: no bearer token on request");
-    callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
-    return;
-  }
-
   try {
-    const { resources } = await verifyLoreToken(token);
+    const { resources } = await callerGrants(call.metadata);
     // repository_list.rs calls this with resource_filter: "urc" — a category, not a
     // specific resource — asking for every repository the token grants. Only treat the
     // filter as a single-resource lookup when it's an actual "urc-..." resource_id.
@@ -138,8 +195,7 @@ async function lookupUserPermissions(
       })),
     });
   } catch (err) {
-    console.warn("LookupUserPermissions: token verification failed:", err);
-    callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
+    failRpc("LookupUserPermissions", callback, err);
   }
 }
 
@@ -148,15 +204,8 @@ async function checkUserPermission(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   callback: grpc.sendUnaryData<any>
 ): Promise<void> {
-  const token = extractBearerToken(call.metadata);
-  if (!token) {
-    console.warn("CheckUserPermission: no bearer token on request");
-    callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
-    return;
-  }
-
   try {
-    const { resources } = await verifyLoreToken(token);
+    const { resources } = await callerGrants(call.metadata);
 
     const allowed: { resource_id: string; permission: string[] }[] = [];
     const denied: { resource_id: string; permission: string[] }[] = [];
@@ -170,8 +219,7 @@ async function checkUserPermission(
 
     callback(null, { allowed_resource_permission: allowed, denied_resource_permission: denied });
   } catch (err) {
-    console.warn("CheckUserPermission: token verification failed:", err);
-    callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
+    failRpc("CheckUserPermission", callback, err);
   }
 }
 
@@ -179,24 +227,22 @@ async function checkUserPermission(
 // for a specific repository — clone, push, pull all need this, not just the simpler
 // listing/creation calls we implemented first. It exchanges the broad AuthN token from
 // login for one scoped to the requested resource(s), used for the storage/revision/lock
-// connections that operation opens. Our token model doesn't narrow scope on exchange (the
-// original token already carries the full granted resource list) — this mints a fresh
-// token with the same claims after confirming every requested resource is authorized,
-// which is what the client's own verify_jwt_usage_for_remote check on the result expects.
+// connections that operation opens. It mints a fresh token after confirming every
+// requested resource is authorized, which is what the client's own
+// verify_jwt_usage_for_remote check on the result expects.
+//
+// The new token carries the caller's *current* grants rather than copying the ones on the
+// presented token, which is what lets a just-created repository be cloned without logging
+// in again: loreserver authorizes storage reads against the token's own `resources` claim
+// (its JWT interceptor never calls this service), so this exchange is the only point where
+// a stale claim can be refreshed.
 async function exchangeUserTokenForMultiresourceToken(
   call: grpc.ServerUnaryCall<{ resource_id: string[] }, unknown>,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   callback: grpc.sendUnaryData<any>
 ): Promise<void> {
-  const token = extractBearerToken(call.metadata);
-  if (!token) {
-    console.warn("ExchangeUserTokenForMultiresourceToken: no bearer token on request");
-    callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
-    return;
-  }
-
   try {
-    const { sub: userId, name: userName, resources } = await verifyLoreToken(token);
+    const { userId, userName, resources } = await callerGrants(call.metadata);
     const requested = call.request.resource_id ?? [];
     const denied = requested.filter((id) => !resources.some((r) => matchesResource(r.partition, id)));
     console.log(
@@ -221,8 +267,7 @@ async function exchangeUserTokenForMultiresourceToken(
       token: { user_token: loreToken, expires_at: expiresAt, user_id: userId, user_name: userName },
     });
   } catch (err) {
-    console.warn("ExchangeUserTokenForMultiresourceToken: failed:", err);
-    callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
+    failRpc("ExchangeUserTokenForMultiresourceToken", callback, err);
   }
 }
 
@@ -235,17 +280,23 @@ async function createResource(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   callback: grpc.sendUnaryData<any>
 ): Promise<void> {
-  const token = extractBearerToken(call.metadata);
-  if (!token) {
-    console.warn("CreateResource: no bearer token on request");
-    callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
-    return;
-  }
-
   try {
-    const { sub: userId } = await verifyLoreToken(token);
+    const { userId } = await callerIdentity(call.metadata);
     const partition = call.request.resource_id.replace(/^urc-/, "");
-    const { created } = await grantResource(userId, partition, ["owner"]);
+
+    let created: boolean;
+    try {
+      ({ created } = await grantResource(userId, partition, ["owner"]));
+    } catch (err) {
+      // Clerk caps a user's metadata at 8KB across public/private/unsafe combined, which
+      // is on the order of 70-110 grants. Reporting a write failure as an auth error
+      // would send whoever hits it looking at tokens rather than at a full bucket.
+      throw new RpcError(
+        grpc.status.UNAVAILABLE,
+        `Could not record the grant in Clerk (metadata is capped at 8KB per user): ${(err as Error).message}`
+      );
+    }
+
     console.log(`CreateResource: user=${userId} partition=${partition} created=${created}`);
     if (!created) {
       // repository_create.rs explicitly treats AlreadyExists as success, not an error.
@@ -254,8 +305,7 @@ async function createResource(
     }
     callback(null, {});
   } catch (err) {
-    console.warn("CreateResource: failed:", err);
-    callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
+    failRpc("CreateResource", callback, err);
   }
 }
 
@@ -268,22 +318,23 @@ async function deleteResource(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   callback: grpc.sendUnaryData<any>
 ): Promise<void> {
-  const token = extractBearerToken(call.metadata);
-  if (!token) {
-    console.warn("DeleteResource: no bearer token on request");
-    callback({ code: grpc.status.UNAUTHENTICATED, message: "Missing bearer token" });
-    return;
-  }
-
   try {
-    const { sub: userId } = await verifyLoreToken(token);
+    const { userId } = await callerIdentity(call.metadata);
     const partition = call.request.resource_id.replace(/^urc-/, "");
-    await revokeResource(userId, partition);
+
+    try {
+      await revokeResource(userId, partition);
+    } catch (err) {
+      throw new RpcError(
+        grpc.status.UNAVAILABLE,
+        `Could not revoke the grant in Clerk: ${(err as Error).message}`
+      );
+    }
+
     console.log(`DeleteResource: user=${userId} partition=${partition}`);
     callback(null, {});
   } catch (err) {
-    console.warn("DeleteResource: failed:", err);
-    callback({ code: grpc.status.UNAUTHENTICATED, message: `Invalid token: ${(err as Error).message}` });
+    failRpc("DeleteResource", callback, err);
   }
 }
 
