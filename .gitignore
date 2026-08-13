@@ -2,3 +2,4 @@ node_modules/
 dist/
 .env
 scripts/test-signing-key.pem
+public/vendor/

@@ -4,19 +4,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/vendor-clerk.mjs",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
     "@clerk/backend": "^1.15.0",
-    "@clerk/clerk-js": "^5.127.2",
     "@grpc/grpc-js": "^1.11.1",
     "@grpc/proto-loader": "^0.7.13",
     "express": "^4.19.2",
     "jose": "^5.9.3"
   },
   "devDependencies": {
+    "@clerk/clerk-js": "^5.127.2",
     "@types/express": "^4.17.21",
     "@types/node": "^22.5.0",
     "tsx": "^4.19.0",

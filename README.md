@@ -400,7 +400,7 @@ request path.
 
 `clerk-js` is **self-hosted** rather than loaded from a public CDN: this page reads the user's
 Clerk session, so it shouldn't depend on a third-party origin for the script that does it. It's
-served from the installed `@clerk/clerk-js` package under `/vendor/clerk`. The whole `dist`
+served from the installed `@clerk/clerk-js` devDependency package under `/vendor/clerk`. The whole `dist`
 directory is exposed rather than the single entry file because `clerk.browser.js` is code-split and
 resolves its lazily-loaded chunks relative to its own script URL.
 

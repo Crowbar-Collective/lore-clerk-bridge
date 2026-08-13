@@ -1,4 +1,5 @@
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import express, { type Express, type Response } from "express";
 import { getSession, completeSession } from "./sessionStore.js";
@@ -9,12 +10,20 @@ import { createRateLimiter, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS } from "./rateL
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
 
-// Served straight out of node_modules rather than copied into public/: clerk.browser.js
-// is code-split across ~130 sibling chunks that it resolves relative to its own script
-// URL (document.currentScript.src), so the whole dist directory has to be reachable
-// under one prefix. Self-hosted rather than loaded from a public CDN because this page
-// reads the user's Clerk session.
-const CLERK_DIST_DIR = path.join(__dirname, "..", "node_modules", "@clerk", "clerk-js", "dist");
+// Self-hosted rather than loaded from a public CDN, because this page reads the user's
+// Clerk session and should not depend on a third party for the script that does it.
+// clerk.browser.js is code-split and resolves its chunks relative to its own script URL
+// (document.currentScript.src), so the whole set has to sit behind one prefix.
+//
+// `npm run build` vendors those files into public/ (see scripts/vendor-clerk.mjs), which
+// is what lets @clerk/clerk-js stay a devDependency and be pruned from the deployed
+// image. The node_modules fallback is for local development, where `npm run dev` runs
+// without a build; in a built image that directory is gone, so a missing vendor step
+// surfaces as a 404 on the script rather than silently working.
+const VENDORED_CLERK_DIR = path.join(PUBLIC_DIR, "vendor", "clerk");
+const CLERK_DIST_DIR = existsSync(VENDORED_CLERK_DIR)
+  ? VENDORED_CLERK_DIR
+  : path.join(__dirname, "..", "node_modules", "@clerk", "clerk-js", "dist");
 const CLERK_SCRIPT_URL = "/vendor/clerk/clerk.browser.js";
 
 function requireEnv(name: string): string {
