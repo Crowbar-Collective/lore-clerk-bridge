@@ -306,16 +306,28 @@ export function createGrpcServer(): grpc.Server {
 
 export function startGrpcServer(port: number): grpc.Server {
   const server = createGrpcServer();
-  // Loopback-only: Caddy (see Caddyfile) is the actual public listener, terminating
-  // TLS and forwarding over local h2c. Railway's TCP Proxy has no TLS of its own, and
-  // its HTTP-domain edge downgrades to HTTP/1.1 before the container, which a native
+  // Caddy (see Caddyfile) is the actual public listener, terminating TLS and
+  // forwarding over h2c. Railway's TCP Proxy has no TLS of its own, and its
+  // HTTP-domain edge downgrades to HTTP/1.1 before the container, which a native
   // HTTP/2-only gRPC server can't speak — so nothing but Caddy should reach this port.
-  server.bindAsync(`127.0.0.1:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
+  //
+  // The default stays loopback because on Railway Caddy runs INSIDE this container,
+  // where loopback both works and keeps the raw port off the public TCP proxy.
+  //
+  // That assumption does not survive a deployment where Caddy is a separate
+  // container: 127.0.0.1 is then this container's own loopback, and Caddy's
+  // `reverse_proxy h2c://bridge:50051` gets connection refused while the HTTP side
+  // keeps working (Express's app.listen defaults to 0.0.0.0) — which reads as a
+  // gRPC/TLS problem rather than a bind-address one. Set GRPC_HOST=0.0.0.0 there.
+  // Safe as long as the port is not published to the host, in which case 0.0.0.0
+  // means "reachable on the container network" and not "reachable from the internet".
+  const host = process.env.GRPC_HOST ?? "127.0.0.1";
+  server.bindAsync(`${host}:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
     if (err) {
       console.error("Failed to bind gRPC server:", err);
       process.exit(1);
     }
-    console.log(`UrcAuthApi gRPC server listening on 127.0.0.1:${boundPort}`);
+    console.log(`UrcAuthApi gRPC server listening on ${host}:${boundPort}`);
   });
   return server;
 }
