@@ -306,21 +306,24 @@ export function createGrpcServer(): grpc.Server {
 
 export function startGrpcServer(port: number): grpc.Server {
   const server = createGrpcServer();
-  // Caddy (see Caddyfile) is the actual public listener, terminating TLS and
-  // forwarding over h2c. Railway's TCP Proxy has no TLS of its own, and its
-  // HTTP-domain edge downgrades to HTTP/1.1 before the container, which a native
-  // HTTP/2-only gRPC server can't speak — so nothing but Caddy should reach this port.
+  // By default Caddy (see Caddyfile) is the actual public listener, terminating TLS and
+  // forwarding here over h2c. That split exists because the endpoint has to satisfy two
+  // constraints at once: the `lore` client always connects over TLS, and native gRPC
+  // needs HTTP/2 end to end — an L4 passthrough gives the second but not the first,
+  // while an L7 proxy that downgrades to HTTP/1.1 gives the first but breaks the second
+  // (grpc-js speaks HTTP/2 only, with no fallback).
   //
-  // The default stays loopback because on Railway Caddy runs INSIDE this container,
-  // where loopback both works and keeps the raw port off the public TCP proxy.
+  // The default stays loopback for the bundled-Caddy layout, where Caddy runs INSIDE
+  // this container: loopback works and keeps the raw port off any public listener.
   //
-  // That assumption does not survive a deployment where Caddy is a separate
-  // container: 127.0.0.1 is then this container's own loopback, and Caddy's
-  // `reverse_proxy h2c://bridge:50051` gets connection refused while the HTTP side
-  // keeps working (Express's app.listen defaults to 0.0.0.0) — which reads as a
-  // gRPC/TLS problem rather than a bind-address one. Set GRPC_HOST=0.0.0.0 there.
-  // Safe as long as the port is not published to the host, in which case 0.0.0.0
-  // means "reachable on the container network" and not "reachable from the internet".
+  // That assumption does not survive other layouts. If Caddy runs as a separate
+  // container, 127.0.0.1 is this container's own loopback and Caddy's
+  // `reverse_proxy h2c://bridge:50051` gets connection refused; the same applies when an
+  // edge that speaks gRPC natively targets this port directly. Either way the HTTP side
+  // keeps working (Express's app.listen defaults to 0.0.0.0), so it reads as a gRPC/TLS
+  // problem rather than a bind-address one. Set GRPC_HOST=0.0.0.0 for those. Safe as
+  // long as the port is not published beyond the network you intend, in which case
+  // 0.0.0.0 means "reachable on the container network", not "reachable from the internet".
   const host = process.env.GRPC_HOST ?? "127.0.0.1";
   server.bindAsync(`${host}:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
     if (err) {

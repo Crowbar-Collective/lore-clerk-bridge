@@ -6,9 +6,12 @@ users through [Clerk](https://clerk.com). It implements Lore's
 `lore auth login` opens a browser, you sign in with Clerk, and the CLI gets back a token scoped to
 whatever repositories Clerk says that user can access.
 
+It ships as a single container and makes no assumptions about where it runs — any container host
+works, as long as it can satisfy the [networking requirements](#networking-requirements) below.
+
 ## How it works
 
-There are two independent flows:
+There are four flows:
 
 1. **Browser login** (HTTP, Express): the `lore` CLI opens `/login?session=...` in a browser. That
    redirects to Clerk's Account Portal for sign-in, which redirects back to `/callback`, which runs
@@ -34,101 +37,129 @@ There are two independent flows:
    automatically going forward, without manually editing Clerk metadata each time — that manual
    step is only needed for granting access to repositories someone *else* created.
 
-Both flows are implemented in one service (`src/httpServer.ts` and `src/grpcServer.ts`), but they
-have very different networking requirements, which is the main source of complexity here — see
-below.
+All of it runs in one process (`src/httpServer.ts` and `src/grpcServer.ts`), but the HTTP and gRPC
+sides have very different networking requirements, which is the main source of deployment
+complexity — see below.
 
 ### Why there's a Caddy in front of the gRPC server
 
-Lore's discovered auth endpoint requires TLS (confirmed by testing against the real `lore` CLI —
-it only recognizes `https` and `ucs-auth` schemes for this address, and both initiate a TLS
-handshake unconditionally). That's a problem on Railway specifically:
+Two constraints apply to the gRPC endpoint, and most platform load balancers satisfy at most one:
 
-- Railway's **TCP Proxy** is a raw byte passthrough — no TLS at all, but it *does* preserve native
-  HTTP/2 framing, which raw gRPC needs.
-- Railway's **HTTP-domain** feature (custom domains, `*.up.railway.app`) terminates TLS
-  automatically, but proxies to the container over HTTP/1.1 internally — which breaks a native
-  gRPC server (`@grpc/grpc-js` only speaks HTTP/2, no HTTP/1.1 fallback).
+- **TLS is mandatory.** The `lore` client only recognizes `https` and `ucs-auth` for this address,
+  and both initiate a TLS handshake unconditionally — confirmed by testing against the real binary.
+  A plaintext gRPC listener is unreachable, not merely insecure.
+- **HTTP/2 must survive end to end.** Native gRPC is HTTP/2. Any hop that downgrades to HTTP/1.1
+  breaks it: `@grpc/grpc-js` speaks HTTP/2 only, with no HTTP/1.1 fallback. Plenty of L7 proxies do
+  exactly this downgrade when forwarding to a backend, and the resulting failure surfaces as a
+  generic 502 rather than anything protocol-specific.
 
-Neither option alone works, so the gRPC server sits behind [Caddy](https://caddyserver.com),
-reachable via a raw TCP Proxy. Caddy terminates TLS itself and forwards decrypted traffic to
-`grpc-js` over local `h2c` (HTTP/2 cleartext), preserving native gRPC framing end-to-end. Caddy
-also handles certificate issuance and renewal automatically via a Let's Encrypt DNS-01 challenge
-against Cloudflare — no manual certificate management, ever.
+A raw L4/TCP passthrough preserves HTTP/2 but adds no TLS. A typical L7 HTTP proxy adds TLS but may
+break HTTP/2. So by default the bundled [Caddy](https://caddyserver.com) covers both: it terminates
+TLS itself and forwards to `grpc-js` over `h2c` (HTTP/2 cleartext) inside the container, preserving
+native gRPC framing, and it obtains and renews its own certificate via a Let's Encrypt DNS-01
+challenge — no manual certificate management, ever.
 
-The HTTP side (`/login`, `/callback`, `/.well-known/jwks.json`) doesn't have this problem — Express
-is HTTP/1.1-native, so it works fine behind Railway's normal HTTP-domain routing.
+If your edge *does* support gRPC natively (e.g. an AWS ALB gRPC target group with an ACM
+certificate), you can skip Caddy entirely — see [option B](#grpc-endpoint) below.
+
+The HTTP side has neither problem: Express is HTTP/1.1-native, so any ordinary load balancer or
+reverse proxy in front of it is fine.
 
 ### Why the HTTP side must live on a subdomain of Clerk's primary domain
 
 `/callback` runs Clerk's JS SDK client-side to read the session Clerk's Account Portal just
 created. That only works if the browser already has Clerk's session cookie for that origin.
 Clerk's **satellite domains** feature (for sharing sessions across unrelated domains) requires a
-paid plan. The workaround used here: deploy the bridge's HTTP side on a **subdomain of Clerk's own
+paid plan. The workaround used here: serve the bridge's HTTP side from a **subdomain of Clerk's own
 primary domain** (e.g. `lore-auth.yourcompany.com`, where `yourcompany.com` is already Clerk's
 primary domain). Clerk's session cookie is scoped to the whole primary domain, so any subdomain of
 it receives the cookie automatically — no satellite configuration, no paid plan required.
 
-This means the bridge **cannot** be deployed on Railway's own `*.up.railway.app` domain for the
-HTTP side — it has to be a custom domain under whatever domain Clerk's Account Portal is already
-using.
+This rules out serving the HTTP side from a platform-assigned hostname on an unrelated domain. It
+has to be a domain you control, under whatever domain Clerk's Account Portal already uses.
 
 ## Prerequisites
 
-- A [Lore server](https://github.com/snowfall-games/lore-railway) already deployed (this bridge
-  replaces its default auth, it doesn't replace the server itself).
+- A [Lore server](https://github.com/EpicGames/lore) already deployed (this bridge replaces its
+  default auth, it doesn't replace the server itself).
 - A [Clerk](https://clerk.com) application, with a **custom primary domain** already verified
   (Dashboard → Domains) — not Clerk's default `*.accounts.dev` domain.
-- A [Railway](https://railway.com) account.
-- DNS for your domain hosted on [Cloudflare](https://cloudflare.com) (used for automatic TLS
-  certificate issuance — see below for why).
+- Somewhere to run a container, satisfying the networking requirements below.
+- DNS you control for both hostnames. If you use the bundled Caddy, the gRPC hostname's zone must
+  be on [Cloudflare](https://cloudflare.com) — or swap the `caddy-dns` plugin in the `Dockerfile`
+  for [your provider's](https://github.com/caddy-dns) and adjust the `Caddyfile` accordingly.
 - The `lore` CLI, for testing.
+
+## Networking requirements
+
+The container exposes two independent endpoints.
+
+### HTTP endpoint
+
+Serves `/login`, `/callback`, and `/.well-known/jwks.json` on `PORT` (default `8080`). Plain
+HTTP/1.1, so any load balancer or reverse proxy works, and TLS can be terminated anywhere upstream.
+
+Must be reachable at a **subdomain of Clerk's primary domain** over HTTPS — see
+[why](#why-the-http-side-must-live-on-a-subdomain-of-clerks-primary-domain).
+
+### gRPC endpoint
+
+Pick one:
+
+**Option A — bundled Caddy terminates TLS (default).** Expose `CADDY_GRPC_PORT` (default `8443`)
+through an **L4/TCP passthrough** — an AWS NLB, a plain TCP proxy, a published container port.
+Anything that forwards bytes without interpreting them. Caddy handles TLS and certificates itself,
+so this path needs `GRPC_DOMAIN`, `CF_API_TOKEN`, and a [persistent volume](#persistent-storage).
+
+**Option B — your edge terminates TLS and speaks gRPC.** If your load balancer supports gRPC
+natively over end-to-end HTTP/2 (e.g. an AWS ALB gRPC target group with an ACM certificate), point
+it at `GRPC_PORT` (default `50051`) instead and set `GRPC_HOST=0.0.0.0` so the listener is
+reachable from outside the container. Caddy, `GRPC_DOMAIN`, `CF_API_TOKEN`, and the volume are all
+unnecessary in this mode.
+
+Either way, the client must reach it over TLS at a hostname you control.
+
+### Persistent storage
+
+Only needed for option A. Caddy stores its ACME account and certificates under `$XDG_DATA_HOME`
+(set to `/data` in the `Dockerfile`). Mount a persistent volume there. Without it, an ephemeral
+container filesystem means every redeploy requests a brand-new certificate, and Let's Encrypt's
+duplicate-certificate limit (5 per exact hostname set per week) is reached quickly.
 
 ## Setup
 
-### 1. Deploy this repo to Railway
+### 1. Build and run the container
 
-Fork this repo, then in Railway: **New → GitHub Repo** → select your fork. Railway auto-detects
-the included `Dockerfile` (needed because this service runs both Node and a custom Caddy build —
-Nixpacks alone can't do that).
+The included `Dockerfile` builds the app plus a custom Caddy with the Cloudflare DNS plugin
+compiled in. Deploy it however you normally deploy containers.
 
 ### 2. Set environment variables
 
-On the service, set (see [Environment variables](#environment-variables) below for details on
-each):
+See [Environment variables](#environment-variables) for the full reference.
 
 ```
 CLERK_SECRET_KEY=sk_live_...
 CLERK_PUBLISHABLE_KEY=pk_live_...
 CLERK_ACCOUNT_PORTAL_URL=https://accounts.yourcompany.com
 PUBLIC_HTTP_BASE_URL=https://lore-auth.yourcompany.com
-LORE_SERVER_HOSTNAME=your-lore-server.up.railway.app
+LORE_SERVER_HOSTNAME=lore.yourcompany.com
 LORE_SERVER_ENV=local
 SIGNING_KEY_PEM=<output of: openssl genrsa 2048 | openssl pkcs8 -topk8 -nocrypt>
 PORT=8080
 GRPC_PORT=50051
 CADDY_GRPC_PORT=8443
 GRPC_DOMAIN=lore-auth-grpc.yourcompany.com
-CF_API_TOKEN=<see step 5>
+CF_API_TOKEN=<see step 4>
 ```
 
-### 3. Set up HTTP networking (Clerk side)
+### 3. Wire up DNS
 
-**Settings → Networking → Custom Domain** → add a subdomain of Clerk's primary domain, e.g.
-`lore-auth.yourcompany.com`, targeting port `8080`. Add the CNAME Railway gives you at your DNS
-provider. This **must** be a subdomain of Clerk's primary domain — see
-[why](#why-the-http-side-must-live-on-a-subdomain-of-clerks-primary-domain) above.
+- `PUBLIC_HTTP_BASE_URL`'s hostname → your HTTP endpoint. Must be a subdomain of Clerk's primary
+  domain.
+- `GRPC_DOMAIN` → your gRPC endpoint. Unlike the HTTP side this has no relationship to Clerk; it
+  can be any domain you control DNS for.
 
-### 4. Set up gRPC networking
-
-**Settings → Networking → TCP Proxy** → target port `8443` (Caddy, not the raw gRPC port). Railway
-assigns a `host:port` — note it, you'll need it in step 6.
-
-Add a CNAME at your DNS provider: `GRPC_DOMAIN` (e.g. `lore-auth-grpc.yourcompany.com`) → the TCP
-Proxy host from Railway. Unlike the HTTP side, this domain has no relationship to Clerk — it can
-be any domain you control DNS for.
-
-### 5. Create a Cloudflare API token
+### 4. Create a Cloudflare API token (option A only)
 
 Cloudflare Dashboard → **My Profile → API Tokens → Create Token**, custom policy:
 
@@ -136,44 +167,54 @@ Cloudflare Dashboard → **My Profile → API Tokens → Create Token**, custom 
 - `DNS` — `Edit`
 
 Both scoped to the zone containing `GRPC_DOMAIN`. **Both permission categories are required** —
-`Zone:Read` alone lets Caddy find the zone but not manage records in it, and will fail silently
-with an authentication-looking error that's actually a missing-permission error.
+`Zone:Read` alone lets Caddy find the zone but not manage records in it, and fails with an
+authentication-looking error that's actually a missing-permission error.
 
-Set the token as `CF_API_TOKEN` on the bridge service (step 2).
+### 5. Point your Lore server at the bridge
 
-### 6. Point your Lore server at the bridge
-
-On the **Lore server** (not the bridge), set:
+On the **Lore server** (not the bridge):
 
 ```
 LORE__SERVER__AUTH__JWT_ISSUER=https://lore-auth.yourcompany.com
 LORE__SERVER__AUTH__JWK__ENDPOINT=https://lore-auth.yourcompany.com/.well-known/jwks.json
-LORE__ENVIRONMENT__ENDPOINT__AUTH_URL=ucs-auth://lore-auth-grpc.yourcompany.com:<TCP proxy port from step 4>
+LORE__ENVIRONMENT__ENDPOINT__AUTH_URL=https://lore-auth-grpc.yourcompany.com:<public gRPC port>
 ```
 
-Leave `LORE__SERVER__AUTH__JWT_AUDIENCE` unset — the bridge sets `aud` on minted tokens itself
-(from `LORE_SERVER_HOSTNAME`), and the Lore server doesn't need to separately validate it.
+Use the `https://` scheme on `AUTH_URL`, not `ucs-auth://`. The Lore server's own auth client
+(`lore-server/src/authnz/auth.rs`) only enables TLS when the URL literally starts with `https://`;
+with any other scheme it attempts a plaintext connection and fails immediately. The `lore` CLI
+accepts both, so this bites only on the server side.
 
-### 7. Grant users access
+Leave `LORE__SERVER__AUTH__JWT_AUDIENCE` unset unless you have a reason to set it — if you do set
+it, the bridge's `LORE_SERVER_JWT_AUDIENCE` must match one of its values.
+
+### 6. Grant users access
 
 In Clerk Dashboard → **Users** → a user → **public metadata**:
 
 ```json
-{ "resources": [{ "partition": "<repo-partition-id>", "permissions": ["read", "write"] }] }
+{ "resources": [{ "partition": "<repository-id>", "permissions": ["read", "write"] }] }
 ```
 
-### 8. Verify
+`partition` is the 32-hex-character Lore repository ID. `"*"` grants every repository — the Lore
+server understands that natively as a wildcard for content operations, though wildcard-only grants
+can't be enumerated, so `lore repository list` shows only explicitly-granted repositories.
+
+Repositories a user creates themselves are added here automatically (see flow 4 above).
+
+### 7. Verify
 
 ```bash
 # JWKS endpoint should return one RSA key:
 curl https://lore-auth.yourcompany.com/.well-known/jwks.json
 
-# gRPC endpoint should complete a TLS handshake showing a real (production, not
-# staging) Let's Encrypt cert for GRPC_DOMAIN:
-openssl s_client -connect lore-auth-grpc.yourcompany.com:<TCP proxy port>
+# gRPC endpoint should complete a TLS handshake presenting a real (production, not
+# staging) Let's Encrypt certificate for GRPC_DOMAIN:
+openssl s_client -connect lore-auth-grpc.yourcompany.com:<public gRPC port>
 
 # End to end:
-lore auth login grpc://your-lore-server.up.railway.app:<port>
+lore auth login grpcs://lore.yourcompany.com:<port>
+lore repository list grpcs://lore.yourcompany.com:<port>
 ```
 
 `lore auth login` should open a browser, take you through Clerk sign-in, and report success back
@@ -189,36 +230,40 @@ in the terminal.
 | `PUBLIC_HTTP_BASE_URL` | Bridge | This service's own public URL, **with `https://` scheme**. Also used as the `iss` claim on minted tokens — must match `LORE__SERVER__AUTH__JWT_ISSUER` on the Lore server exactly |
 | `LORE_SERVER_HOSTNAME` | Bridge | Bare hostname (no scheme, no port) of your Lore server. Used as the `aud` claim — must exactly match the host you pass to `lore auth login`, or the CLI rejects the token locally |
 | `LORE_SERVER_ENV` | Bridge | Must match the Lore server's own `--env`/`LORE_ENV` (default `local`). Required on the JWT — loreserver's `AuthorizationToken` struct fails to decode the token at all without it. Its value doesn't appear to be checked against anything, just required to be present |
-| `LORE_SERVER_JWT_AUDIENCE` | Bridge | Only matters if the Lore server has `[server.auth] jwt_audience` configured — check its config for `LORE__SERVER__AUTH__JWT_AUDIENCE`. When set, this must match one of those values (default `lore-service`); it's carried alongside `LORE_SERVER_HOSTNAME` in `aud` since the CLI and the server each require a different value there |
+| `LORE_SERVER_JWT_AUDIENCE` | Bridge | Only matters if the Lore server has `[server.auth] jwt_audience` configured. When set, this must match one of those values (default `lore-service`); it's carried alongside `LORE_SERVER_HOSTNAME` in `aud` since the CLI and the server each require a different value there |
 | `SIGNING_KEY_PEM` | Bridge | RSA private key (PKCS8 PEM) for signing tokens. Must stay stable across restarts — an ephemeral key (the fallback if unset) invalidates all outstanding tokens on every redeploy |
-| `PORT` | Bridge | Express's port, routed to by Railway's HTTP-domain feature. Default `8080` |
-| `GRPC_PORT` | Bridge | `grpc-js`'s port, loopback-only — only Caddy talks to it. Default `50051` |
-| `CADDY_GRPC_PORT` | Bridge | Caddy's public-facing port, targeted by the Railway TCP Proxy. Default `8443` |
-| `GRPC_DOMAIN` | Bridge | Domain Caddy serves TLS for and gets a cert for. Must have a CNAME to the TCP Proxy host |
-| `CF_API_TOKEN` | Bridge | Cloudflare token, scoped to `Zone:Read` + `DNS:Edit` on `GRPC_DOMAIN`'s zone |
+| `PORT` | Bridge | Express's port. Default `8080` |
+| `GRPC_PORT` | Bridge | `grpc-js`'s port. Default `50051` |
+| `GRPC_HOST` | Bridge | Bind address for `grpc-js`. Default `127.0.0.1`, correct when Caddy runs in the same container. Set `0.0.0.0` when Caddy runs as a separate container, or when your edge talks to `GRPC_PORT` directly (option B) — otherwise connections are refused while the HTTP side keeps working, which reads as a TLS problem rather than a bind-address one |
+| `CADDY_GRPC_PORT` | Bridge | Caddy's public-facing port. Default `8443`. Option A only |
+| `GRPC_DOMAIN` | Bridge | Hostname Caddy serves TLS for and obtains a certificate for. Option A only |
+| `CF_API_TOKEN` | Bridge | Cloudflare token, scoped to `Zone:Read` + `DNS:Edit` on `GRPC_DOMAIN`'s zone. Option A only |
 | `LORE__SERVER__AUTH__JWT_ISSUER` | Lore server | Must equal `PUBLIC_HTTP_BASE_URL` |
 | `LORE__SERVER__AUTH__JWK__ENDPOINT` | Lore server | `<PUBLIC_HTTP_BASE_URL>/.well-known/jwks.json` |
-| `LORE__ENVIRONMENT__ENDPOINT__AUTH_URL` | Lore server | `ucs-auth://<GRPC_DOMAIN>:<TCP proxy port>` |
+| `LORE__ENVIRONMENT__ENDPOINT__AUTH_URL` | Lore server | `https://<GRPC_DOMAIN>:<public gRPC port>` — must use the `https://` scheme, see [step 5](#5-point-your-lore-server-at-the-bridge) |
 
 ## Troubleshooting
 
-**Deploy crash-loops with `EADDRINUSE` on startup.** `PORT` and `GRPC_PORT` (or `CADDY_GRPC_PORT`)
-resolved to the same value — usually because Railway auto-assigns its own `PORT` and it happened
-to collide with a manually-set `GRPC_PORT`. Pin both explicitly to distinct values.
+**Crash loop with `EADDRINUSE` on startup.** `PORT` and `GRPC_PORT` (or `CADDY_GRPC_PORT`) resolved
+to the same value. Some platforms inject their own `PORT`, which can collide with a manually-set
+port. Pin all of them explicitly to distinct values.
 
 **Login completes in the browser but the CLI never sees it / `window.Clerk.session` is empty on
 `/callback`.** The bridge's HTTP side isn't on a subdomain of Clerk's primary domain — see
-[why](#why-the-http-side-must-live-on-a-subdomain-of-clerks-primary-domain) above. It cannot be on
-Railway's own domain.
+[why](#why-the-http-side-must-live-on-a-subdomain-of-clerks-primary-domain).
 
-**`openssl s_client` against the gRPC domain: `wrong version number`.** Something in front of the
-gRPC server isn't speaking TLS — check the Railway TCP Proxy is targeting Caddy's port
-(`CADDY_GRPC_PORT`), not `GRPC_PORT` directly.
+**`openssl s_client` against the gRPC endpoint: `wrong version number`.** Nothing in that path is
+speaking TLS. On option A, check the passthrough targets `CADDY_GRPC_PORT` and not `GRPC_PORT`.
 
-**`lore auth login` fails with a 502-flavored error, or Railway's network log shows the gRPC method
-path (e.g. `/epic_urc.UrcAuthApi/StartAuthSession`) returning 502/404.** The gRPC domain is routed
-through Railway's HTTP-domain feature instead of a TCP Proxy. Native gRPC needs the raw TCP Proxy
-+ Caddy setup described above — Railway's HTTP-domain routing can't carry it.
+**`openssl s_client` connects but hangs with `unexpected eof`.** The connection reaches something,
+but nothing is listening on the target port inside the container. Usually the passthrough points at
+a port nothing serves, or `GRPC_HOST` is loopback while the listener needs to be reachable from
+outside the container.
+
+**gRPC calls fail with 502, or your proxy's logs show the gRPC method path (e.g.
+`/epic_urc.UrcAuthApi/StartAuthSession`) returning 502/404.** The gRPC endpoint is behind an L7
+proxy that downgrades to HTTP/1.1 before the container. Native gRPC needs end-to-end HTTP/2 — use an
+L4/TCP passthrough to Caddy (option A) or a load balancer with real gRPC support (option B).
 
 **Caddy logs show `no memory of presenting a DNS record` / Cloudflare `HTTP 403` or `401`.** The
 Cloudflare token is invalid or missing a permission. Verify it directly:
@@ -228,16 +273,67 @@ fails with an authentication-looking error even though the real problem is scope
 
 **Caddy's logs mention `acme-staging-v02.api.letsencrypt.org`.** Not itself the bug — Caddy falls
 back to Let's Encrypt's staging CA automatically after repeated failures, to avoid burning your
-production rate limit while you fix the real problem. Fix whatever's actually failing (see the
-Cloudflare item above) and it'll go back to issuing a real production cert.
+production rate limit while you fix the real problem. Fix whatever's actually failing (see above)
+and it'll go back to issuing a production certificate.
 
-**`lore auth login` opens a browser but Windows says it can't find the URL / the CLI errors
-`ExitStatus(1)` while opening the URL.** `PUBLIC_HTTP_BASE_URL` is missing its `https://` scheme —
-the login URL gets built directly from it, and without a scheme Windows tries to treat it as a
-filename instead of a URL to open.
+**Caddy's certificate cache resets on every deploy / Let's Encrypt rate limit
+(`too many certificates ... already issued for this exact set of identifiers`).** No persistent
+volume is mounted at `/data` — see [persistent storage](#persistent-storage). If you're already
+rate-limited, either wait out the 7-day window or point `GRPC_DOMAIN` at a fresh hostname; the
+limit is keyed to the exact set of names in the certificate.
+
+**Lore server logs `transport error` / `broken pipe` when calling the auth service.**
+`LORE__ENVIRONMENT__ENDPOINT__AUTH_URL` isn't using the `https://` scheme. The Lore server only
+enables TLS for that literal prefix — see [step 5](#5-point-your-lore-server-at-the-bridge).
+
+**`lore auth login` opens a browser but the OS says it can't find the URL / the CLI errors
+`ExitStatus(1)` while opening it.** `PUBLIC_HTTP_BASE_URL` is missing its `https://` scheme — the
+login URL is built directly from it, and without a scheme the OS treats it as a filename.
 
 **`JWT 'aud' does not specify remote domain '...'`.** `LORE_SERVER_HOSTNAME` doesn't exactly match
 the host you passed to `lore auth login`. It needs to be the bare hostname — no scheme, no port.
+
+**Lore server logs `Unexpected error decoding JWT AuthN token ... Error(InvalidAudience)`.**
+The Lore server has `[server.auth] jwt_audience` configured and the token's `aud` doesn't contain
+any of those values. Set `LORE_SERVER_JWT_AUDIENCE` on the bridge to match. This is independent of
+`LORE_SERVER_HOSTNAME` — both end up in `aud` together, since the CLI's own local check and the
+server's `jwt_audience` check each require a different value there.
+
+**Lore server logs `Unexpected error decoding JWT AuthN token ... missing field '<name>'`, and
+requests fail with a permission-denied-flavored error even though `lore auth login` succeeded.**
+The Lore server's `AuthorizationToken` struct requires claims beyond the JWT standard ones: `env`,
+`preferred_username`, and `idp`. `LORE_SERVER_ENV` covers `env`; the bridge sets the other two
+itself. If this reappears after a Lore server upgrade, check
+`lore-server/src/auth/jwt.rs`'s `AuthorizationToken` for a newly required field — this fails token
+decoding entirely, before repository authorization is reached, so it looks like a permissions
+problem even though it's unrelated.
+
+**Everything authenticates, but repository content operations fail with `Unauthorized` /
+`The caller does not have permission to execute the specified operation`, with nothing useful in
+the Lore server logs.** The JWT's `resources` claim must use loreserver's own field names —
+`{"resource_id": "urc-<id>", "permission": [...]}` — not the `{partition, permissions}` shape
+Clerk metadata stores. The bridge converts between them (`toWireResources`/`fromWireResources` in
+[src/signing.ts](src/signing.ts)). This one fails *silently*: loreserver's `verify_token_internal`
+wraps the `AuthorizationToken` decode in `if let Ok(..)`, so a malformed `resources` claim falls
+through to the `JWTUserInfo` fallback, which has no `resources` field and yields `resources: None`
+— after which every authorization check denies with a bare "Unauthorized" and no decode error is
+logged. `repository list`/`create` keep working in this state, because they consult the bridge's
+`LookupUserPermissions` over gRPC rather than reading the claim.
+
+**`lore repository list`/`create` work, but `clone` (or push/pull) fails repeatedly with
+`authorization header required` / `Get request failed` / `channel closed`, eventually giving up
+with `Repository not found`.** Listing and creating don't need a repository-scoped connection;
+clone/push/pull do, via `ExchangeUserTokenForMultiresourceToken` (see
+[architecture](#how-it-works)). If that RPC isn't answered, the token exchange fails quietly enough
+that the client still attempts the storage connections with no valid credential — the repeated
+failures and eventual disconnect are a symptom of that, not of a literally missing header.
+
+**`lore repository create` fails with `The server does not implement the method
+/ucs.auth.RebacApi/CreateResource`.** The Lore server calls a second gRPC service
+(`ucs.auth.RebacApi`, vendored as `proto/rebac_api.proto`) on repository creation and deletion,
+separate from `UrcAuthApi`. The bridge implements both `CreateResource` and `DeleteResource` on the
+same server and port — if you see this, the deployed build predates that, or the proto didn't make
+it into the image.
 
 **A change to token claims doesn't take effect — old behavior persists even after
 `lore auth login`.** The client caches tokens on disk in `tokens.toml` (under the per-user local
@@ -246,64 +342,38 @@ points). Crucially, **repository-scoped authz tokens are keyed `{auth_url}/{repo
 `lore auth logout` against the *server* URL doesn't clear them, and `login` only refreshes the
 authn token. A still-valid cached authz token is reused without ever calling the auth service
 (`lore-transport/src/auth/exchange.rs` returns early on a cache hit), so the bridge sees no request
-at all. To force a clean exchange, either delete `tokens.toml` or point the store somewhere fresh:
+at all. To force a clean exchange, delete `tokens.toml` or point the store somewhere fresh:
 
 ```
-$env:LORE_AUTH_PATH = "C:\some\empty\dir"
+LORE_AUTH_PATH=/some/empty/dir
 ```
 
 This only matters when token *contents* change — a normal deployment never hits it.
 
-**Everything authenticates, but repository content operations fail with `Unauthorized` /
-`The caller does not have permission to execute the specified operation`, with nothing useful in
-the Lore server logs.** The JWT's `resources` claim must use loreserver's own field names —
-`{"resource_id": "urc-<id>", "permission": [...]}` — not the `{partition, permissions}` shape
-Clerk metadata stores. The bridge converts between them (`toWireResources`/`fromWireResources` in
-[src/signing.ts](src/signing.ts)). This one fails *silently*: loreserver's `verify_token_internal`
-wraps the `AuthorizationToken` decode in `if let Ok(..)`, so a malformed `resources` claim just
-falls through to the `JWTUserInfo` fallback, which has no `resources` field and yields
-`resources: None` — after which every authorization check denies with a bare "Unauthorized" and no
-decode error is ever logged. Note that `repository list`/`create` keep working in this state,
-because they consult the bridge's `LookupUserPermissions` over gRPC rather than reading the claim.
+## Callback pages
 
-**`lore repository list`/`create` work, but `clone` (or push/pull) fails repeatedly with
-`authorization header required` / `Get request failed` / `channel closed`, eventually giving up
-with `Repository not found`.** Listing and creating don't need a repository-scoped connection;
-clone/push/pull do, via `ExchangeUserTokenForMultiresourceToken` (see
-[architecture](#how-it-works) above). If this RPC isn't implemented, the client's token exchange
-fails silently enough that it still attempts the storage connections, just with no valid
-credential attached — the repeated failures and eventual disconnect are a symptom of that, not of
-a literally missing header on your end.
+The browser-facing pages are plain static files under `public/`, with no server-side templating:
 
-**`lore repository create` fails with `The server does not implement the method
-/ucs.auth.RebacApi/CreateResource`.** The Lore server calls a second gRPC service (`ucs.auth.RebacApi`,
-vendored as `proto/rebac_api.proto`) on repository creation/deletion, separate from `UrcAuthApi`. The
-bridge implements both `CreateResource` and `DeleteResource` on the same server/port — if you see
-this, the deployed build predates that, or the proto didn't get copied into the Docker image.
+```
+public/callback.html         served by GET /callback (behind the session guard)
+public/session-error.html    served by /login and /callback on an unknown/expired session
+public/assets/callback.js    the sign-in logic
+public/assets/styles.css     shared styling
+```
 
-**Lore server logs `Unexpected error decoding JWT AuthN token ... Error(InvalidAudience)`.**
-The Lore server has `[server.auth] jwt_audience` configured (check its `bucket.toml`/`local.toml`/
-`LORE__SERVER__AUTH__JWT_AUDIENCE`) and the token's `aud` doesn't contain any of those values. Set
-`LORE_SERVER_JWT_AUDIENCE` on the bridge to match. This is independent of `LORE_SERVER_HOSTNAME` —
-both end up in `aud` together, since the CLI's own local check and the server's `jwt_audience`
-check each require a different value there.
+Neither dynamic value needs to be interpolated into the markup: the session code is already in the
+query string, and the Clerk publishable key (public by design) comes from `GET /callback/config`.
+That keeps the HTML and JS editable as real files, and leaves no hand-rolled HTML escaping in the
+request path.
 
-**Lore server logs `Unexpected error decoding JWT AuthN token ... missing field '<name>'`, and
-`lore repository list` (or similar) fails with a permission-denied-flavored error even though
-`lore auth login` succeeded.** The Lore server's own `AuthorizationToken` struct requires several
-claims beyond the JWT standard ones: `env`, `preferred_username`, and `idp`. `LORE_SERVER_ENV`
-covers `env`; the bridge sets `preferred_username` and `idp` itself. If this shows up again after
-a Lore server upgrade, check `lore-server/src/auth/jwt.rs`'s `AuthorizationToken` struct for a new
-required field — this fails token decoding entirely, before repository authorization is ever
-reached, so it can look identical to a permissions problem even though it's unrelated.
+`clerk-js` is **self-hosted** rather than loaded from a public CDN — this page reads the user's
+Clerk session, so it shouldn't depend on a third-party origin for the script that does it. It's
+served from the installed `@clerk/clerk-js` package under `/vendor/clerk`. The whole `dist`
+directory is exposed rather than the single entry file because `clerk.browser.js` is code-split and
+resolves its lazily-loaded chunks relative to its own script URL.
 
-**Caddy's certificate cache resets on every deploy / Let's Encrypt rate limit
-(`too many certificates ... already issued for this exact set of identifiers`).** Railway's
-container filesystem is ephemeral across deploys. Attach a Railway Volume to the bridge service at
-mount path `/data` (via the Command Palette or right-click on the project canvas — not under
-Settings) so Caddy's cert cache (`XDG_DATA_HOME=/data`, set in the Dockerfile) survives redeploys.
-If you're already rate-limited, either wait out the 7-day window or temporarily point `GRPC_DOMAIN`
-at a fresh subdomain — Let's Encrypt's limit is keyed to the exact set of domain names in the cert.
+Note that `tsc` only emits compiled TypeScript, so `public/` is copied into the image separately by
+the `Dockerfile` — the same way `proto/` is.
 
 ## Local development
 
@@ -318,3 +388,7 @@ npm run dev
 `scripts/grpc-client-test.mjs` exercises the gRPC API directly against a locally running instance;
 `scripts/mint-test-token.mjs` mints a token without going through Clerk, useful for testing
 `LookupUserPermissions` in isolation.
+
+The login pages can be exercised without Clerk credentials: any `PUBLIC_HTTP_BASE_URL` and
+`CLERK_*` placeholder values are enough to serve `/callback` and the error pages, since the flow
+only reaches Clerk once the page's JavaScript runs.

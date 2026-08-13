@@ -1,7 +1,20 @@
-import express, { type Express } from "express";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import express, { type Express, type Response } from "express";
 import { getSession, completeSession } from "./sessionStore.js";
 import { verifyClerkSessionAndGetGrants } from "./clerk.js";
 import { signLoreToken, getJwks, loreServerAudience, loreServerEnv } from "./signing.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(__dirname, "..", "public");
+
+// Served straight out of node_modules rather than copied into public/: clerk.browser.js
+// is code-split across ~130 sibling chunks that it resolves relative to its own script
+// URL (document.currentScript.src), so the whole dist directory has to be reachable
+// under one prefix. Self-hosted rather than loaded from a public CDN because this page
+// reads the user's Clerk session.
+const CLERK_DIST_DIR = path.join(__dirname, "..", "node_modules", "@clerk", "clerk-js", "dist");
+const CLERK_SCRIPT_URL = "/vendor/clerk/clerk.browser.js";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -9,51 +22,15 @@ function requireEnv(name: string): string {
   return value.replace(/\/$/, "");
 }
 
-function renderCallbackPage(sessionCode: string, publishableKey: string): string {
-  const safeSessionCode = JSON.stringify(sessionCode);
-  const safeKey = publishableKey.replace(/"/g, "");
-  return `<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Lore sign-in</title></head>
-<body>
-<p id="status">Completing sign-in&hellip;</p>
-<script async crossorigin="anonymous" data-clerk-publishable-key="${safeKey}"
-  src="https://cdn.jsdelivr.net/npm/@clerk/clerk-js@5/dist/clerk.browser.js"></script>
-<script>
-  const sessionCode = ${safeSessionCode};
-  const statusEl = document.getElementById("status");
-  window.addEventListener("load", async () => {
-    try {
-      // No satellite config needed: this page must be served from a subdomain of
-      // Clerk's primary domain (devops.crowbargames.com), so the browser already
-      // hands Clerk's session cookie to this origin automatically.
-      await window.Clerk.load();
-      if (!window.Clerk.session) {
-        statusEl.textContent = "No active session detected — please retry lore auth login.";
-        return;
-      }
-      const token = await window.Clerk.session.getToken();
-      const res = await fetch("/callback/complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session: sessionCode, token }),
-      });
-      if (res.ok) {
-        statusEl.textContent = "Signed in — you can close this window and return to the CLI.";
-      } else {
-        statusEl.textContent = "Sign-in failed: " + (await res.text());
-      }
-    } catch (err) {
-      statusEl.textContent = "Sign-in failed: " + err;
-    }
-  });
-</script>
-</body>
-</html>`;
+function sendPage(res: Response, file: string, status = 200): void {
+  res.status(status).sendFile(path.join(PUBLIC_DIR, file));
 }
 
 export function createHttpApp(): Express {
   const app = express();
+
+  app.use("/assets", express.static(path.join(PUBLIC_DIR, "assets")));
+  app.use("/vendor/clerk", express.static(CLERK_DIST_DIR));
 
   app.get("/healthz", (_req, res) => {
     res.send("ok");
@@ -62,7 +39,7 @@ export function createHttpApp(): Express {
   app.get("/login", (req, res) => {
     const sessionCode = typeof req.query.session === "string" ? req.query.session : undefined;
     if (!sessionCode || !getSession(sessionCode)) {
-      res.status(400).send("Unknown or expired login session. Please retry `lore auth login`.");
+      sendPage(res, "session-error.html", 400);
       return;
     }
 
@@ -75,10 +52,22 @@ export function createHttpApp(): Express {
   app.get("/callback", (req, res) => {
     const sessionCode = typeof req.query.session === "string" ? req.query.session : "";
     if (!sessionCode || !getSession(sessionCode)) {
-      res.status(400).send("Unknown or expired login session. Please retry `lore auth login`.");
+      sendPage(res, "session-error.html", 400);
       return;
     }
-    res.type("html").send(renderCallbackPage(sessionCode, requireEnv("CLERK_PUBLISHABLE_KEY")));
+    // The page itself is static; it reads the session code back out of the query string.
+    // Guarding here (rather than serving it via express.static) keeps today's behavior of
+    // rejecting an unknown session up front instead of failing later at /callback/complete.
+    sendPage(res, "callback.html");
+  });
+
+  // The publishable key is public by design — it ships in every Clerk frontend. Serving
+  // it here instead of templating it into the HTML is what keeps the page fully static.
+  app.get("/callback/config", (_req, res) => {
+    res.json({
+      publishableKey: requireEnv("CLERK_PUBLISHABLE_KEY"),
+      clerkScriptUrl: CLERK_SCRIPT_URL,
+    });
   });
 
   app.post("/callback/complete", express.json(), async (req, res) => {
