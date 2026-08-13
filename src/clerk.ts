@@ -19,7 +19,13 @@ export interface ClerkUserGrant {
 // here automatically. This check itself is unaffected either way: it's a direct
 // secretKey verification, independent of which domain issued the token.
 export async function verifyClerkSessionAndGetGrants(sessionToken: string): Promise<ClerkUserGrant> {
-  const claims = await verifyToken(sessionToken, { secretKey });
+  // authorizedParties pins the token to this origin. A Clerk instance can serve several
+  // applications, and without it a session token minted for any of the others would be
+  // accepted here on the strength of its signature alone.
+  const authorizedParties = process.env.PUBLIC_HTTP_BASE_URL
+    ? [process.env.PUBLIC_HTTP_BASE_URL.replace(/\/$/, "")]
+    : undefined;
+  const claims = await verifyToken(sessionToken, { secretKey, authorizedParties });
   const userId = claims.sub;
   if (!userId) {
     throw new Error("Clerk token has no subject claim");

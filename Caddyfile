@@ -2,10 +2,44 @@
 	admin off
 }
 
-{$GRPC_DOMAIN}:{$CADDY_GRPC_PORT} {
+{$GRPC_DOMAIN}:{$CADDY_GRPC_PORT:8443} {
 	tls {
 		dns cloudflare {$CF_API_TOKEN}
 		resolvers 1.1.1.1
 	}
-	reverse_proxy h2c://127.0.0.1:{$GRPC_PORT}
+
+	# `route` rather than `handle` so these are evaluated in written order. Two of these
+	# match the same path and differ only by source address, and relying on Caddy's
+	# specificity sorting to break that tie would be a poor thing to be wrong about.
+	
+	route {
+		
+		# RebacApi.CreateResource grants the CALLER ownership of whatever resource_id the
+		# request names. From loreserver that is correct: it calls immediately after
+		# creating the repository itself. From anyone else it hands out access to any
+		# repository whose ID they know, and loreserver forwards the end user's own bearer
+		# token on that call, so the two are identical on the wire. Source address is the
+		# only thing that separates them.
+		#
+		# Only loreserver ever calls RebacApi; the `lore` CLI never does. Both services
+		# have to answer on this one hostname because loreserver derives the RebacApi
+		# endpoint from the same environment.endpoint.auth_url as UrcAuthApi.
+		#
+		# The default suits a Lore server on the same private network. When it lives
+		# elsewhere, set LORE_SERVER_IPS to its address or CIDR. Leaving the default with a
+		# remote Lore server fails closed: `repository create` returns 403 rather than
+		# quietly leaving the escalation open.
+		
+		@rebac_internal {
+			path /ucs.auth.RebacApi/*
+			remote_ip {$LORE_SERVER_IPS:private_ranges}
+		}
+		reverse_proxy @rebac_internal h2c://127.0.0.1:{$REBAC_PORT:50052}
+
+		@rebac_any path /ucs.auth.RebacApi/*
+		respond @rebac_any "RebacApi is not reachable from here" 403
+
+		# Everything else is UrcAuthApi, which the CLI must be able to reach.
+		reverse_proxy h2c://127.0.0.1:{$GRPC_PORT:50051}
+	}
 }

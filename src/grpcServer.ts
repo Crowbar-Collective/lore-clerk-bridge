@@ -11,6 +11,13 @@ import {
   type ResourceGrant,
 } from "./signing.js";
 import { getUserGrants, grantResource, revokeResource } from "./clerk.js";
+import {
+  createRateLimiter,
+  isTrustedPeer,
+  peerAddress,
+  RATE_LIMIT_MAX,
+  RATE_LIMIT_WINDOW_MS,
+} from "./rateLimit.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROTO_PATH = path.join(__dirname, "..", "proto", "auth_api.proto");
@@ -123,10 +130,36 @@ function healthCheck(
   callback(null, { status: "SERVING" });
 }
 
+// StartAuthSession has to be unauthenticated, since it runs before the user has logged
+// in. MAX_SESSIONS bounds the memory that lets an anonymous caller consume; this bounds
+// the rate at which they can churn it, so a flood cannot keep evicting real users'
+// pending logins.
+const sessionLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
+
+// gRPC metadata is just HTTP/2 headers, so a proxy's X-Forwarded-For arrives here the
+// same way it does on the HTTP side. Trust it only from a private peer, for the reason
+// given in rateLimit.ts; otherwise every request behind the proxy shares one bucket and
+// a single abuser locks out everyone.
+function callerAddress(call: grpc.ServerUnaryCall<unknown, unknown>): string {
+  const peer = peerAddress(call.getPeer());
+  if (!isTrustedPeer(peer)) return peer;
+  const [forwarded] = call.metadata.get("x-forwarded-for");
+  if (!forwarded) return peer;
+  const value = typeof forwarded === "string" ? forwarded : forwarded.toString("utf8");
+  return value.split(",")[0]?.trim() || peer;
+}
+
 function startAuthSession(
   call: grpc.ServerUnaryCall<{ client_state: string }, unknown>,
   callback: grpc.sendUnaryData<{ session_code: string; login_url: string }>
 ): void {
+  const address = callerAddress(call);
+  if (!sessionLimiter.check(address)) {
+    console.warn(`StartAuthSession: rate limited ${address}`);
+    callback({ code: grpc.status.RESOURCE_EXHAUSTED, message: "Too many requests" });
+    return;
+  }
+
   const clientState = call.request.client_state ?? "";
   const sessionCode = createSession(clientState);
   const baseUrl = requirePublicBaseUrl();
@@ -338,6 +371,7 @@ async function deleteResource(
   }
 }
 
+// Public: the `lore` CLI has to reach this, so it is exposed through Caddy.
 export function createGrpcServer(): grpc.Server {
   const server = new grpc.Server();
   server.addService(urcAuthApiService, {
@@ -348,6 +382,24 @@ export function createGrpcServer(): grpc.Server {
     CheckUserPermission: checkUserPermission,
     ExchangeUserTokenForMultiresourceToken: exchangeUserTokenForMultiresourceToken,
   });
+  return server;
+}
+
+// Internal: RebacApi is served on its own listener because CreateResource grants the
+// CALLER ownership of whatever resource_id the request names. Reached from loreserver
+// that is exactly right, since loreserver only calls it after it has itself created the
+// repository. Reached directly by a user it is privilege escalation: present a valid
+// login token, name someone else's repository ID, and the grant lands in your own Clerk
+// metadata, after which LookupUserPermissions, CheckUserPermission and the token
+// exchange all authorize you for it.
+//
+// It cannot be told apart by credentials: loreserver forwards the end user's own bearer
+// token on this call (lore-server/src/authnz/rebac.rs), so a legitimate call and a
+// hand-crafted one are byte-identical. Only loreserver ever calls RebacApi, so the
+// separation that does work is network reachability, hence a second listener that stays
+// off the public edge.
+export function createRebacServer(): grpc.Server {
+  const server = new grpc.Server();
   server.addService(rebacApiService, {
     CreateResource: createResource,
     DeleteResource: deleteResource,
@@ -382,6 +434,23 @@ export function startGrpcServer(port: number): grpc.Server {
       process.exit(1);
     }
     console.log(`UrcAuthApi gRPC server listening on ${host}:${boundPort}`);
+  });
+  return server;
+}
+
+// Defaults to loopback and stays there unless deliberately opened. Where loreserver runs
+// in a separate container, set REBAC_HOST to the address reachable on that private
+// network only, and never publish this port at the edge: unlike GRPC_PORT, nothing
+// outside loreserver has any reason to reach it.
+export function startRebacServer(port: number): grpc.Server {
+  const server = createRebacServer();
+  const host = process.env.REBAC_HOST ?? "127.0.0.1";
+  server.bindAsync(`${host}:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
+    if (err) {
+      console.error("Failed to bind RebacApi server:", err);
+      process.exit(1);
+    }
+    console.log(`RebacApi gRPC server listening on ${host}:${boundPort} (internal only)`);
   });
   return server;
 }

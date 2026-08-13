@@ -4,6 +4,7 @@ import express, { type Express, type Response } from "express";
 import { getSession, completeSession } from "./sessionStore.js";
 import { verifyClerkSessionAndGetGrants } from "./clerk.js";
 import { signLoreToken, getJwks, loreServerAudience, loreServerEnv } from "./signing.js";
+import { createRateLimiter, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS } from "./rateLimit.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
@@ -26,8 +27,18 @@ function sendPage(res: Response, file: string, status = 200): void {
   res.status(status).sendFile(path.join(PUBLIC_DIR, file));
 }
 
+// Every call here spends a Clerk verifyToken plus a getUser, so an unauthenticated flood
+// burns the deployment's Clerk quota rather than just its own CPU.
+const completeLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
+
 export function createHttpApp(): Express {
   const app = express();
+
+  // Only believe X-Forwarded-For from a private peer. This service is designed to sit
+  // behind a proxy, so a request from a private address arrived through one and its
+  // forwarded address is meaningful; a request straight off the internet can claim any
+  // address it likes and is rate-limited by the address it actually came from.
+  app.set("trust proxy", ["loopback", "linklocal", "uniquelocal"]);
 
   app.use("/assets", express.static(path.join(PUBLIC_DIR, "assets")));
   app.use("/vendor/clerk", express.static(CLERK_DIST_DIR));
@@ -71,6 +82,14 @@ export function createHttpApp(): Express {
   });
 
   app.post("/callback/complete", express.json(), async (req, res) => {
+    const clientIp = req.ip ?? "unknown";
+    if (!completeLimiter.check(clientIp)) {
+      console.warn(`/callback/complete: rate limited ${clientIp}`);
+      res.set("Retry-After", String(completeLimiter.retryAfter(clientIp)));
+      res.status(429).json({ error: "Too many requests" });
+      return;
+    }
+
     const { session: sessionCode, token } = req.body ?? {};
     if (typeof sessionCode !== "string" || typeof token !== "string") {
       res.status(400).json({ error: "session and token are required" });

@@ -84,6 +84,13 @@ it receives the cookie automatically: no satellite configuration, no paid plan r
 This rules out serving the HTTP side from a platform-assigned hostname on an unrelated domain. It
 has to be a domain you control, under whatever domain Clerk's Account Portal already uses.
 
+A Clerk Dashboard setting worth noting: Clerk Dashboard → **Domains → Allowed subdomains**. When that
+toggle is on, only the primary domain and explicitly listed subdomains may make cross-origin
+requests to Clerk's Frontend API, and everything else is rejected. `/callback` is precisely such a
+request, so the bridge's hostname has to be in that list. Clerk recommends enabling the allowlist
+in production, so this is worth setting up rather than avoiding; just remember to add
+`PUBLIC_HTTP_BASE_URL`'s hostname when you do.
+
 ## Prerequisites
 
 - A [Lore server](https://github.com/EpicGames/lore) already deployed (this bridge replaces its
@@ -101,7 +108,7 @@ has to be a domain you control, under whatever domain Clerk's Account Portal alr
 
 ## Networking requirements
 
-The container exposes two independent endpoints.
+The container exposes three listeners: two public, one internal.
 
 ### HTTP endpoint
 
@@ -127,6 +134,36 @@ reachable from outside the container. Caddy, `GRPC_DOMAIN`, `CF_API_TOKEN`, and 
 unnecessary in this mode.
 
 Either way, the client must reach it over TLS at a hostname you control.
+
+### RebacApi endpoint (internal only)
+
+`RebacApi.CreateResource` grants **the caller** ownership of whatever `resource_id` the request
+names. That is correct coming from loreserver, which calls it immediately after creating a
+repository. Called directly by a user it is privilege escalation: present a valid login token, name
+a repository ID you don't own, and the grant lands in your own Clerk metadata, after which every
+authorization path accepts you for it. loreserver forwards the end user's own bearer token on that
+call, so a legitimate call and a forged one are identical on the wire; only reachability separates
+them.
+
+The bridge therefore serves RebacApi on its own listener (`REBAC_PORT`, default `50052`, bound to
+`REBAC_HOST`, default loopback). **Never expose it publicly.** Only loreserver calls RebacApi; the
+CLI never does.
+
+Because loreserver derives the RebacApi endpoint from the same `environment.endpoint.auth_url` as
+`UrcAuthApi`, both have to answer on one hostname, so the edge splits them by gRPC method path.
+**The bundled `Caddyfile` already does this.** The only thing to decide is which sources count as
+your Lore server, via `LORE_SERVER_IPS`:
+
+- **Lore server on the same private or compose network** (the default, `private_ranges`): nothing
+  to set.
+- **Lore server elsewhere**: set `LORE_SERVER_IPS` to its address or CIDR, e.g. `203.0.113.10/32`.
+
+Leaving the default with a remote Lore server fails closed rather than open: `repository create`
+returns 403, instead of quietly leaving RebacApi reachable by any authenticated user.
+
+If you replace the bundled Caddy with your own edge, reproduce the same split. Note that Caddy
+reorders `handle` blocks by its own directive sorting, so use `route` when two matchers differ only
+by source address.
 
 ### Persistent storage
 
@@ -257,6 +294,12 @@ in the terminal.
 | `PORT` | Bridge | Express's port. Default `8080` |
 | `GRPC_PORT` | Bridge | `grpc-js`'s port. Default `50051` |
 | `GRPC_HOST` | Bridge | Bind address for `grpc-js`. Default `127.0.0.1`, correct when Caddy runs in the same container. Set `0.0.0.0` when Caddy runs as a separate container, or when your edge talks to `GRPC_PORT` directly (option B); otherwise connections are refused while the HTTP side keeps working, which reads as a TLS problem rather than a bind-address one |
+| `REBAC_PORT` | Bridge | RebacApi's port, separate from `GRPC_PORT`. Default `50052`. Must never be publicly reachable; see [RebacApi endpoint](#rebacapi-endpoint-internal-only) |
+| `REBAC_HOST` | Bridge | Bind address for RebacApi. Default `127.0.0.1`. Set to the private-network address only when loreserver runs in another container |
+| `LORE_SERVER_IPS` | Bridge (Caddy) | Sources the bundled `Caddyfile` accepts RebacApi calls from. Default `private_ranges`, which suits a Lore server on the same private network; set it to that server's address or CIDR when it runs elsewhere |
+| `MAX_SESSIONS` | Bridge | Ceiling on tracked login sessions, oldest evicted first. Default `10000`. Bounds what an anonymous caller can allocate through the unauthenticated `StartAuthSession` |
+| `RATE_LIMIT_MAX` | Bridge | Requests per source address per window, applied separately to `StartAuthSession` and `POST /callback/complete`. Default `30`; a real login uses one call of each |
+| `RATE_LIMIT_WINDOW_SECONDS` | Bridge | Window for `RATE_LIMIT_MAX`. Default `60` |
 | `CADDY_GRPC_PORT` | Bridge | Caddy's public-facing port. Default `8443`. Option A only |
 | `GRPC_DOMAIN` | Bridge | Hostname Caddy serves TLS for and obtains a certificate for. Option A only |
 | `CF_API_TOKEN` | Bridge | Cloudflare token, scoped to `Zone:Read` + `DNS:Edit` on `GRPC_DOMAIN`'s zone. Option A only |
@@ -271,7 +314,10 @@ to the same value. Some platforms inject their own `PORT`, which can collide wit
 port. Pin all of them explicitly to distinct values.
 
 **Login completes in the browser but the CLI never sees it / `window.Clerk.session` is empty on
-`/callback`.** The bridge's HTTP side isn't on a subdomain of Clerk's primary domain; see
+`/callback`.** Two causes produce this same symptom. Either the bridge's HTTP side isn't on a
+subdomain of Clerk's primary domain, or it is but Clerk is rejecting it: check Dashboard →
+**Domains → Allowed subdomains**, and if that allowlist is enabled, confirm the bridge's hostname
+is on it. The browser console shows a Frontend API error naming the disallowed origin. See
 [why](#why-the-http-side-must-live-on-a-subdomain-of-clerks-primary-domain).
 
 **`openssl s_client` against the gRPC endpoint: `wrong version number`.** Nothing in that path is

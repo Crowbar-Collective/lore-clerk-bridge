@@ -15,9 +15,28 @@ interface SessionRecord {
 }
 
 const SESSION_TTL_MS = 5 * 60 * 1000;
+
+// StartAuthSession is necessarily unauthenticated (it runs before the user has logged in),
+// so anyone who can reach the gRPC endpoint can create sessions. Without a ceiling that is
+// an unbounded allocation driven by an anonymous caller. Sessions are tiny and expire in
+// five minutes, so this only has to be large enough that real logins never reach it while
+// still bounding the damage; evicting oldest-first keeps a flood from locking out
+// legitimate users, since a flood's own entries are the first to go.
+const MAX_SESSIONS = Number(process.env.MAX_SESSIONS ?? 10_000);
 const sessions = new Map<string, SessionRecord>();
 
 export function createSession(clientState: string): string {
+  if (sessions.size >= MAX_SESSIONS) {
+    sweepExpiredSessions();
+    // Map preserves insertion order, so the first remaining key is the oldest.
+    while (sessions.size >= MAX_SESSIONS) {
+      const oldest = sessions.keys().next();
+      if (oldest.done) break;
+      sessions.delete(oldest.value);
+    }
+    console.warn(`Session store at capacity (${MAX_SESSIONS}); evicting oldest entries`);
+  }
+
   const sessionCode = randomBytes(24).toString("base64url");
   sessions.set(sessionCode, {
     clientState,
