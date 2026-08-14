@@ -3,7 +3,7 @@
 A bridge service that lets [Lore](https://github.com/EpicGames/lore) authenticate
 users through [Clerk](https://clerk.com). 
 
-[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 
 It implements Lore's `UrcAuthApi` gRPC service backed by a Clerk sign-in flow, so the `lore` CLI and desktop client work exactly as they normally would:
