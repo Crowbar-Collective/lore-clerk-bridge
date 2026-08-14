@@ -1,4 +1,4 @@
-# Lore Clerk Bridge
+# Lore Clerk Auth Bridge
 
 A bridge service that lets [Lore](https://github.com/EpicGames/lore) authenticate
 users through [Clerk](https://clerk.com). 
