@@ -1,10 +1,13 @@
-# lore-clerk-bridge
+# Lore Clerk Bridge
 
-A bridge service developed by Crowbar Collective that lets [Lore](https://github.com/EpicGames/lore) authenticate
-users through [Clerk](https://clerk.com). It implements Lore's
-`UrcAuthApi` gRPC service backed by a Clerk sign-in flow, so the `lore` CLI and desktop client work exactly as they normally would:
-`lore auth login` opens a browser, you sign in with Clerk, and the CLI gets back a token scoped to
-whatever repositories Clerk says that user can access.
+A bridge service that lets [Lore](https://github.com/EpicGames/lore) authenticate
+users through [Clerk](https://clerk.com). 
+
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
+
+
+It implements Lore's `UrcAuthApi` gRPC service backed by a Clerk sign-in flow, so the `lore` CLI and desktop client work exactly as they normally would:
+`lore auth login` opens a browser, you sign in with Clerk, and the CLI gets back a token scoped to whatever repositories Clerk says that user can access.
 
 It ships as a single container and makes no assumptions about where it runs: any container host
 works, as long as it can satisfy the [networking requirements](#networking-requirements) below.
