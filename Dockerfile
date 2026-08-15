@@ -1,9 +1,3 @@
-# Custom Caddy build: the base Caddy image doesn't include DNS-provider plugins, and
-# we need caddy-dns/cloudflare specifically so Caddy can complete Let's Encrypt's
-# DNS-01 challenge directly against our Cloudflare zone.
-FROM caddy:2-builder-alpine AS caddy-build
-RUN xcaddy build --with github.com/caddy-dns/cloudflare
-
 FROM node:20-alpine AS node-build
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -22,7 +16,11 @@ RUN npm prune --omit=dev
 
 FROM node:20-alpine
 WORKDIR /app
-COPY --from=caddy-build /usr/bin/caddy /usr/bin/caddy
+# The stock Caddy binary is enough: certificates come from Let's Encrypt's HTTP-01
+# challenge, which needs no DNS-provider plugin and so no custom xcaddy build. Only a
+# deployment that cannot expose ports 80 and 443 needs DNS-01, and with it a rebuilt
+# Caddy carrying a caddy-dns plugin; see the README.
+COPY --from=caddy:2-alpine /usr/bin/caddy /usr/bin/caddy
 COPY --from=node-build /app/dist ./dist
 COPY --from=node-build /app/node_modules ./node_modules
 COPY --from=node-build /app/proto ./proto

@@ -2,18 +2,19 @@
 	admin off
 }
 
-{$GRPC_DOMAIN}:{$CADDY_GRPC_PORT:8443} {
-	tls {
-		dns cloudflare {$CF_API_TOKEN}
-		resolvers 1.1.1.1
-	}
-
+# Port 443, with Caddy also binding port 80 for Let's Encrypt's HTTP-01 challenge and the
+# HTTP->HTTPS redirect. Both have to be reachable from the internet for a certificate to
+# be issued, which is the one requirement this default carries.
+#
+# If your platform cannot give you 80 and 443 (a proxy that only offers an arbitrary
+# port, for instance), neither HTTP-01 nor TLS-ALPN-01 can be solved and you need the
+# DNS-01 alternative instead: set CADDY_GRPC_PORT, add a caddy-dns plugin to the
+# Dockerfile, and add a `tls` block here. See the README.
+{$GRPC_DOMAIN}:{$CADDY_GRPC_PORT:443} {
 	# `route` rather than `handle` so these are evaluated in written order. Two of these
-	# match the same path and differ only by source address, and relying on Caddy's
-	# specificity sorting to break that tie would be a poor thing to be wrong about.
-	
+	# match the same path and differ only by source address, and Caddy reorders `handle`
+	# blocks by its own directive sorting, which would be a poor thing to be wrong about.
 	route {
-		
 		# RebacApi.CreateResource grants the CALLER ownership of whatever resource_id the
 		# request names. From loreserver that is correct: it calls immediately after
 		# creating the repository itself. From anyone else it hands out access to any
@@ -29,7 +30,6 @@
 		# elsewhere, set LORE_SERVER_IPS to its address or CIDR. Leaving the default with a
 		# remote Lore server fails closed: `repository create` returns 403 rather than
 		# quietly leaving the escalation open.
-		
 		@rebac_internal {
 			path /ucs.auth.RebacApi/*
 			remote_ip {$LORE_SERVER_IPS:private_ranges}
