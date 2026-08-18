@@ -1,97 +1,89 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
-// Long-lived API keys for non-interactive clients: CI agents, build machines, anything
-// that cannot complete a browser sign-in. A key is only ever an *identifier* — it maps to
-// a Clerk user, and every grant still comes from that user's Clerk metadata at the moment
-// of exchange. Nothing about a key confers access on its own.
+// Long-lived API keys for clients that cannot complete a browser sign-in — CI agents above
+// all. A key carries the Clerk user it belongs to, so verifying one is a direct lookup
+// rather than a search:
 //
-// Keys are configured as their SHA-256 digests rather than in the clear, so a leaked
-// environment (a container inspect, a crash dump, a log of process env) does not hand over
-// working credentials. The bridge never needs the original value, only to recognise it.
+//   lore_ci_user_2abcDEF.mzJ8kQ...
+//   ^^^^^^^^ ^^^^^^^^^^^ ^^^^^^^^
+//   prefix   Clerk user  secret
 //
-// Format of LORE_API_KEYS, one entry per line or comma-separated:
+// The SHA-256 of the *whole* key is stored on that user's Clerk privateMetadata, under
+// `loreApiKeyDigests`. Three things follow from that choice:
 //
-//   user_2abcDEF...:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+//   - There is no deployment configuration at all. No environment variable, no Terraform
+//     input, no SSM parameter, nothing to redeploy. Issuing and revoking a key is an edit
+//     in the Clerk dashboard, beside the repository grants it is paired with.
+//   - Verification is free. The exchange already fetches the Clerk user to read its
+//     grants, and the digests arrive in that same response.
+//   - Because the user ID is inside the hashed material, a key issued for one user cannot
+//     be replayed as another.
 //
-// Generate with scripts/generate-api-key.mjs.
+// privateMetadata, not publicMetadata: the latter is readable by the frontend, and these
+// digests have no business leaving the server.
 
-const ENV_VAR = "LORE_API_KEYS";
+const KEY_PATTERN = /^lore_ci_(user_[A-Za-z0-9]+)\.([A-Za-z0-9_-]{16,})$/;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 
-interface ApiKeyEntry {
-  userId: string;
-  digest: Buffer;
-}
+/** Metadata field holding a user's API key digests. */
+export const DIGEST_FIELD = "loreApiKeyDigests";
 
-let cachedSource: string | undefined;
-let cachedEntries: ApiKeyEntry[] = [];
-
-function parse(source: string): ApiKeyEntry[] {
-  const entries: ApiKeyEntry[] = [];
-
-  // Split by line first so a "# ..." comment covers the rest of its line rather than only
-  // its first word, then by comma within a line for the single-line form.
-  const fields = source
-    .split(/\r?\n/)
-    .map((line) => line.replace(/#.*$/, ""))
-    .flatMap((line) => line.split(","));
-
-  for (const raw of fields) {
-    const line = raw.trim();
-    if (!line) continue;
-
-    // rsplit on ":" so a userId containing a colon would not break parsing; the digest is
-    // always the final field.
-    const separator = line.lastIndexOf(":");
-    if (separator <= 0) {
-      console.warn(`${ENV_VAR}: ignoring malformed entry (expected <userId>:<sha256>)`);
-      continue;
-    }
-    const userId = line.slice(0, separator).trim();
-    const digest = line.slice(separator + 1).trim().toLowerCase();
-    if (!userId || !DIGEST_PATTERN.test(digest)) {
-      console.warn(`${ENV_VAR}: ignoring entry for "${userId}" (digest is not a sha256 hex string)`);
-      continue;
-    }
-    entries.push({ userId, digest: Buffer.from(digest, "hex") });
-  }
-  return entries;
-}
-
-function entries(): ApiKeyEntry[] {
-  const source = process.env[ENV_VAR] ?? "";
-  if (source !== cachedSource) {
-    cachedSource = source;
-    cachedEntries = parse(source);
-  }
-  return cachedEntries;
-}
-
-/** Whether any API keys are configured at all. */
-export function apiKeysConfigured(): boolean {
-  return entries().length > 0;
+/**
+ * The Clerk user a key claims to belong to, or {@code null} if it is not a well-formed key.
+ *
+ * <p>This is only a claim. It says which user's digests to check against, and is worthless
+ * until {@link apiKeyMatches} confirms the secret half.
+ */
+export function apiKeyUserId(presented: string): string | null {
+  return KEY_PATTERN.exec(presented ?? "")?.[1] ?? null;
 }
 
 /**
- * The Clerk user ID an API key maps to, or {@code null} if it matches none.
+ * Whether a presented key matches any digest stored for its user.
  *
- * <p>Every configured entry is compared, without returning early on a match, and each
- * comparison is constant-time. Bailing out at the first hit would make response time
- * depend on a key's position in the list, and a plain === on the digest would leak how
- * many leading bytes a guess got right.
+ * <p>Every digest is compared, without returning early, and each comparison is
+ * constant-time. Bailing out on the first hit would make response time depend on a key's
+ * position in the list, and a plain string comparison would leak how many leading bytes a
+ * guess got right.
+ *
+ * <p>Multiple digests per user are supported so a key can be rotated without downtime: add
+ * the new one, move CI over, then drop the old.
  */
-export function resolveApiKey(presented: string): string | null {
-  if (!presented) return null;
+export function apiKeyMatches(presented: string, storedDigests: unknown): boolean {
+  if (!presented) return false;
+
+  const digests = normaliseDigests(storedDigests);
+  if (digests.length === 0) return false;
 
   const candidate = createHash("sha256").update(presented, "utf8").digest();
-  let matched: string | null = null;
-
-  for (const entry of entries()) {
-    // Digests are fixed-width SHA-256, so lengths always agree and timingSafeEqual cannot
-    // throw here.
-    if (timingSafeEqual(candidate, entry.digest)) {
-      matched = entry.userId;
+  let matched = false;
+  for (const digest of digests) {
+    // Both are fixed-width SHA-256, so lengths always agree and timingSafeEqual cannot throw.
+    if (timingSafeEqual(candidate, digest)) {
+      matched = true;
     }
   }
   return matched;
+}
+
+/**
+ * Reads the digest list out of Clerk metadata, which is untyped JSON that an administrator
+ * edits by hand. A single string is accepted as well as an array, since that is the obvious
+ * thing to type when there is only one key.
+ */
+function normaliseDigests(stored: unknown): Buffer[] {
+  const raw = typeof stored === "string" ? [stored] : Array.isArray(stored) ? stored : [];
+  const digests: Buffer[] = [];
+  for (const value of raw) {
+    if (typeof value !== "string") continue;
+    const normalised = value.trim().toLowerCase();
+    if (!DIGEST_PATTERN.test(normalised)) {
+      // A malformed entry is far more likely to be a typo than an attack, and silently
+      // ignoring it would present as a key that simply stops working.
+      console.warn(`${DIGEST_FIELD}: ignoring entry that is not a sha256 hex digest`);
+      continue;
+    }
+    digests.push(Buffer.from(normalised, "hex"));
+  }
+  return digests;
 }

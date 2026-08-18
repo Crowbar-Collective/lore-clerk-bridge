@@ -173,7 +173,6 @@ each one, including the failure it prevents; this table is the index.
 | `REBAC_PORT` | `50052` | `RebacApi`. Never expose publicly; see [RebacApi endpoint](#rebacapi-endpoint-internal-only) |
 | `REBAC_HOST` | `127.0.0.1` | As `GRPC_HOST`, for RebacApi |
 | `LORE_SERVER_IPS` | `private_ranges` | Sources Caddy accepts RebacApi calls from |
-| `LORE_API_KEYS` | empty | API keys for non-interactive clients; see [CI and other non-interactive clients](#ci-and-other-non-interactive-clients) |
 | `MAX_SESSIONS` | `10000` | Ceiling on tracked login sessions |
 | `RATE_LIMIT_MAX` | `30` | Per source address, per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Window for the above |
@@ -213,27 +212,60 @@ same path for clients that use it. Without them the CLI fails with
    node scripts/generate-api-key.mjs user_2abcDEF...
    ```
 
-4. Put the printed `user:digest` entry in `LORE_API_KEYS` and restart the bridge.
+4. Paste the printed digest into that user's **private** metadata:
+
+   ```json
+   { "loreApiKeyDigests": ["<digest>"] }
+   ```
+
 5. Store the key itself in your CI credential store. It is shown once; a lost key is
    reissued, not recovered.
+
+There is deliberately **no configuration for this service** — no environment variable, no
+deployment input. Everything about a key lives on the Clerk user it belongs to, next to the
+grants it is paired with.
+
+### How a key is verified
+
+A key carries the user it belongs to:
+
+```
+lore_ci_user_2abcDEF.mzJ8kQ...
+^^^^^^^^ ^^^^^^^^^^^ ^^^^^^^^
+prefix   Clerk user  secret
+```
+
+So verification is a direct lookup rather than a search, and it is free: the exchange
+already fetches that Clerk user to read its grants, and the digests arrive in the same
+response. Because the user ID is inside the hashed material, a key issued for one user
+cannot be replayed as another.
 
 ### What a key is, and is not
 
 A key is an **identifier, not a capability**. It names a Clerk user, and the repositories on
-the issued token come from that user's Clerk metadata at the moment of exchange — the same
+the issued token come from that user's `publicMetadata` at the moment of exchange — the same
 source, read the same way, as an interactive login. A request cannot ask for resources; it
 can only prove which identity it is. This is the distinction that keeps the API key path
 from reopening the escalation described under
 [RebacApi endpoint](#rebacapi-endpoint-internal-only).
 
-Only the SHA-256 digest of each key is configured, so an exposed environment — a container
-inspect, a crash dump, a process listing — does not yield a working credential. Comparison
-is constant-time, and every configured entry is checked without an early return, so neither
-response timing nor position in the list leaks anything.
+Digests are held in `privateMetadata`, which is server-side only, unlike the `publicMetadata`
+the grants live in. Only the SHA-256 is stored, so neither Clerk nor a compromised instance
+yields a working credential. Comparison is constant-time, and every stored digest is checked
+without an early return, so neither response timing nor position in the list leaks anything.
+
+Failures are deliberately indistinguishable to the caller — a malformed key, an unknown
+user and a wrong secret all return the same `Invalid API key` — so this cannot be used to
+enumerate which CI identities exist. The server log distinguishes them.
+
+### Revoking and rotating
+
+Remove the digest from the user's `privateMetadata`. It takes effect on the next exchange:
+no restart, no redeploy. To rotate without downtime, add the new digest to the array, move
+the agent over, then drop the old one.
 
 The **issued token keeps the ordinary one-hour lifetime**. The long-lived secret is the key,
-which is why a client should log in per run rather than caching the token. Revoke by
-deleting the entry and restarting.
+which is why a client should log in per run rather than caching the token.
 
 Attempts are rate limited per source address, in a separate budget from `StartAuthSession`
 so that neither can exhaust the other's.

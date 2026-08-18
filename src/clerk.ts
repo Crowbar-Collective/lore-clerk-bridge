@@ -1,5 +1,6 @@
 import { createClerkClient, verifyToken } from "@clerk/backend";
 import type { ResourceGrant } from "./signing.js";
+import { DIGEST_FIELD } from "./apiKeys.js";
 
 const secretKey = process.env.CLERK_SECRET_KEY;
 if (!secretKey) {
@@ -12,7 +13,15 @@ export interface ClerkUserGrant {
   userId: string;
   userName: string;
   resources: ResourceGrant[];
+  /**
+   * Raw `privateMetadata.loreApiKeyDigests`, for the API key exchange to verify against.
+   * Untyped because it is hand-edited JSON; apiKeys.ts is what makes sense of it.
+   */
+  apiKeyDigests: unknown;
 }
+
+/** Raised when Clerk says the user does not exist, as opposed to being unreachable. */
+export class ClerkUserNotFound extends Error {}
 
 // The bridge is deployed on a subdomain of Clerk's primary domain (not on Clerk's
 // satellite-domain feature, which needs a paid plan), so its session cookie arrives
@@ -44,6 +53,7 @@ function toUserGrant(user: any): ClerkUserGrant {
       user.primaryEmailAddress?.emailAddress ||
       user.id,
     resources: (user.publicMetadata?.resources as ResourceGrant[] | undefined) ?? [],
+    apiKeyDigests: user.privateMetadata?.[DIGEST_FIELD],
   };
 }
 
@@ -56,12 +66,24 @@ export async function getUserGrants(userId: string): Promise<ResourceGrant[]> {
   return (user.publicMetadata?.resources as ResourceGrant[] | undefined) ?? [];
 }
 
-// Identity and grants for a user known by ID rather than by a presented session. Used by
-// the API key exchange, where there is no Clerk session to verify — the key itself is the
-// credential, and everything about the identity it maps to still comes from Clerk.
-export async function getUserIdentityAndGrants(userId: string): Promise<ClerkUserGrant> {
-  return toUserGrant(await clerkClient.users.getUser(userId));
+// Identity, grants and API key digests for a user known by ID rather than by a presented
+// session. Used by the API key exchange, where there is no Clerk session to verify.
+//
+// A missing user is reported distinctly from an unreachable Clerk: the first is an
+// authentication failure (a key naming a user that no longer exists), the second is an
+// outage. Collapsing them would either return UNAVAILABLE for a revoked key, or report a
+// Clerk outage as a credential problem and send someone hunting the wrong fault.
+export async function getUserForApiKey(userId: string): Promise<ClerkUserGrant> {
+  try {
+    return toUserGrant(await clerkClient.users.getUser(userId));
+  } catch (err) {
+    if ((err as { status?: number })?.status === 404) {
+      throw new ClerkUserNotFound(`No Clerk user ${userId}`);
+    }
+    throw err;
+  }
 }
+
 
 // Backs RebacApi.CreateResource: when a user creates a new repository, loreserver
 // calls back here to register them as its owner (lore-server/src/grpc/handlers/

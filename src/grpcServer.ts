@@ -11,12 +11,13 @@ import {
   type ResourceGrant,
 } from "./signing.js";
 import {
+  ClerkUserNotFound,
+  getUserForApiKey,
   getUserGrants,
-  getUserIdentityAndGrants,
   grantResource,
   revokeResource,
 } from "./clerk.js";
-import { apiKeysConfigured, resolveApiKey } from "./apiKeys.js";
+import { apiKeyMatches, apiKeyUserId } from "./apiKeys.js";
 import {
   createRateLimiter,
   isTrustedPeer,
@@ -316,16 +317,17 @@ async function exchangeUserTokenForMultiresourceToken(
 }
 
 // Long-lived API keys exist for clients that cannot complete a browser sign-in — CI agents
-// above all. The key is only an identifier: it names a Clerk user, and the grants on the
-// resulting token are read from that user's Clerk metadata at exchange time, exactly as
-// they are for an interactive login. Nothing in the request can influence them.
+// above all. A key names the Clerk user it belongs to and carries a secret half whose
+// SHA-256 is stored on that user in Clerk; see apiKeys.ts for the format and why the
+// digests live there rather than in this service's configuration.
 //
-// That distinction is what keeps this from being the escalation described above RebacApi:
-// a caller cannot name the resources it wants, only prove which identity it is.
+// The key is only an identifier. Grants on the resulting token are read from the same
+// Clerk user, exactly as they are for an interactive login, so nothing in the request can
+// influence them. That is what keeps this from being the escalation described above
+// RebacApi: a caller cannot name the resources it wants, only prove which identity it is.
 //
 // The minted token keeps the ordinary short lifetime. The long-lived secret is the key,
-// which lives in the CI system's credential store and can be revoked by deleting one line
-// of configuration; the bearer token it produces is good for an hour.
+// revoked by removing its digest in Clerk — no restart and no redeploy.
 async function mintTokenForApiKey(
   apiKey: string,
   address: string
@@ -333,40 +335,44 @@ async function mintTokenForApiKey(
   if (!apiKeyLimiter.check(address)) {
     throw new RpcError(grpc.status.RESOURCE_EXHAUSTED, "Too many requests");
   }
-  if (!apiKey) {
-    throw new RpcError(grpc.status.INVALID_ARGUMENT, "No API key supplied");
-  }
-  if (!apiKeysConfigured()) {
-    // Distinguished in the log only. Telling the caller that no keys exist would confirm
-    // to anyone probing that this deployment has the feature switched off.
-    console.warn("API key exchange attempted but LORE_API_KEYS is empty");
-    throw new RpcError(grpc.status.UNAUTHENTICATED, "Invalid API key");
-  }
 
-  const userId = resolveApiKey(apiKey);
-  if (!userId) {
-    console.warn(`API key exchange: no match for key presented by ${address}`);
-    throw new RpcError(grpc.status.UNAUTHENTICATED, "Invalid API key");
+  // Every rejection below is the same message. Distinguishing "no such user" from "wrong
+  // secret" would turn this into an oracle for which CI identities exist.
+  const invalid = new RpcError(grpc.status.UNAUTHENTICATED, "Invalid API key");
+
+  const claimedUserId = apiKeyUserId(apiKey);
+  if (!claimedUserId) {
+    console.warn(`API key exchange: malformed key from ${address}`);
+    throw invalid;
   }
 
   let identity;
   try {
-    identity = await getUserIdentityAndGrants(userId);
+    identity = await getUserForApiKey(claimedUserId);
   } catch (err) {
+    if (err instanceof ClerkUserNotFound) {
+      console.warn(`API key exchange: key names unknown user ${claimedUserId}, from ${address}`);
+      throw invalid;
+    }
     // Same reasoning as callerGrants: a Clerk outage must not read as "authorized for
     // nothing", which would look like a legitimate denial.
     throw new RpcError(
       grpc.status.UNAVAILABLE,
-      `Could not load permissions from Clerk: ${(err as Error).message}`
+      `Could not load user from Clerk: ${(err as Error).message}`
     );
   }
 
+  if (!apiKeyMatches(apiKey, identity.apiKeyDigests)) {
+    console.warn(`API key exchange: no matching digest for ${claimedUserId}, from ${address}`);
+    throw invalid;
+  }
+
   console.log(
-    `API key exchange: user=${userId} resources=${identity.resources.length} from=${address}`
+    `API key exchange: user=${identity.userId} resources=${identity.resources.length} from=${address}`
   );
 
   const { token: loreToken, expiresAt } = await signLoreToken({
-    userId,
+    userId: identity.userId,
     userName: identity.userName,
     issuer: requirePublicBaseUrl(),
     audience: loreServerAudience(),
@@ -377,7 +383,7 @@ async function mintTokenForApiKey(
   return {
     user_token: loreToken,
     expires_at: expiresAt,
-    user_id: userId,
+    user_id: identity.userId,
     user_name: identity.userName,
   };
 }
