@@ -31,16 +31,20 @@ export async function verifyClerkSessionAndGetGrants(sessionToken: string): Prom
     throw new Error("Clerk token has no subject claim");
   }
 
-  const user = await clerkClient.users.getUser(userId);
-  const resources = (user.publicMetadata?.resources as ResourceGrant[] | undefined) ?? [];
+  return toUserGrant(await clerkClient.users.getUser(userId));
+}
 
-  const userName =
-    user.username ||
-    [user.firstName, user.lastName].filter(Boolean).join(" ") ||
-    user.primaryEmailAddress?.emailAddress ||
-    userId;
-
-  return { userId, userName, resources };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function toUserGrant(user: any): ClerkUserGrant {
+  return {
+    userId: user.id,
+    userName:
+      user.username ||
+      [user.firstName, user.lastName].filter(Boolean).join(" ") ||
+      user.primaryEmailAddress?.emailAddress ||
+      user.id,
+    resources: (user.publicMetadata?.resources as ResourceGrant[] | undefined) ?? [],
+  };
 }
 
 // Current grants for a user, straight from Clerk. The authorization RPCs use this rather
@@ -50,6 +54,13 @@ export async function verifyClerkSessionAndGetGrants(sessionToken: string): Prom
 export async function getUserGrants(userId: string): Promise<ResourceGrant[]> {
   const user = await clerkClient.users.getUser(userId);
   return (user.publicMetadata?.resources as ResourceGrant[] | undefined) ?? [];
+}
+
+// Identity and grants for a user known by ID rather than by a presented session. Used by
+// the API key exchange, where there is no Clerk session to verify — the key itself is the
+// credential, and everything about the identity it maps to still comes from Clerk.
+export async function getUserIdentityAndGrants(userId: string): Promise<ClerkUserGrant> {
+  return toUserGrant(await clerkClient.users.getUser(userId));
 }
 
 // Backs RebacApi.CreateResource: when a user creates a new repository, loreserver

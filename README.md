@@ -173,6 +173,7 @@ each one, including the failure it prevents; this table is the index.
 | `REBAC_PORT` | `50052` | `RebacApi`. Never expose publicly; see [RebacApi endpoint](#rebacapi-endpoint-internal-only) |
 | `REBAC_HOST` | `127.0.0.1` | As `GRPC_HOST`, for RebacApi |
 | `LORE_SERVER_IPS` | `private_ranges` | Sources Caddy accepts RebacApi calls from |
+| `LORE_API_KEYS` | empty | API keys for non-interactive clients; see [CI and other non-interactive clients](#ci-and-other-non-interactive-clients) |
 | `MAX_SESSIONS` | `10000` | Ceiling on tracked login sessions |
 | `RATE_LIMIT_MAX` | `30` | Per source address, per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Window for the above |
@@ -186,6 +187,56 @@ each one, including the failure it prevents; this table is the index.
 | `LORE__SERVER__AUTH__JWT_ISSUER` | Must equal `PUBLIC_HTTP_BASE_URL` |
 | `LORE__SERVER__AUTH__JWK__ENDPOINT` | `<PUBLIC_HTTP_BASE_URL>/.well-known/jwks.json` |
 | `LORE__ENVIRONMENT__ENDPOINT__AUTH_URL` | `https://<GRPC_DOMAIN>`. The `https://` scheme is required; see [step 5](#5-point-your-lore-server-at-the-bridge) |
+
+## CI and other non-interactive clients
+
+`lore auth login` opens a browser, which a build agent cannot do. For those, the bridge
+accepts a long-lived **API key** and exchanges it for an ordinary short-lived Lore token:
+
+```bash
+lore login lore://your-server:41337 --token-type api-key --token <key>
+```
+
+This implements `UrcAuthApi.ExchangeExternalTokenForUserToken`, which is what the CLI calls
+for `--token-type api-key` despite the name; `ExchangeAPIKeyForUserToken` is wired to the
+same path for clients that use it. Without them the CLI fails with
+`The server does not implement the method ExchangeExternalTokenForUserToken`.
+
+### Issuing a key
+
+1. Create a **dedicated Clerk user** for the agent — not a person's account. Builds are then
+   attributed correctly, and revoking CI access never disturbs someone's login.
+2. Grant it repositories the usual way, in `publicMetadata.resources`.
+3. Generate a key:
+
+   ```bash
+   node scripts/generate-api-key.mjs user_2abcDEF...
+   ```
+
+4. Put the printed `user:digest` entry in `LORE_API_KEYS` and restart the bridge.
+5. Store the key itself in your CI credential store. It is shown once; a lost key is
+   reissued, not recovered.
+
+### What a key is, and is not
+
+A key is an **identifier, not a capability**. It names a Clerk user, and the repositories on
+the issued token come from that user's Clerk metadata at the moment of exchange — the same
+source, read the same way, as an interactive login. A request cannot ask for resources; it
+can only prove which identity it is. This is the distinction that keeps the API key path
+from reopening the escalation described under
+[RebacApi endpoint](#rebacapi-endpoint-internal-only).
+
+Only the SHA-256 digest of each key is configured, so an exposed environment — a container
+inspect, a crash dump, a process listing — does not yield a working credential. Comparison
+is constant-time, and every configured entry is checked without an early return, so neither
+response timing nor position in the list leaks anything.
+
+The **issued token keeps the ordinary one-hour lifetime**. The long-lived secret is the key,
+which is why a client should log in per run rather than caching the token. Revoke by
+deleting the entry and restarting.
+
+Attempts are rate limited per source address, in a separate budget from `StartAuthSession`
+so that neither can exhaust the other's.
 
 ## Networking requirements
 
