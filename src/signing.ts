@@ -92,14 +92,18 @@ async function loadSigningKeys(): Promise<SigningKeys> {
     pem = generated.privateKey;
   }
 
-  const privateKey = await importPKCS8(pem, "RS256");
+  // The deployed .env carries this PEM on a single line with literal backslash-n, because
+  // docker compose env files cannot hold embedded newlines (see scripts/start.sh in the
+  // lore-aws repo). jose's importPKCS8 tolerates that form; Node's createPublicKey does not,
+  // and fails with ERR_OSSL_UNSUPPORTED. Normalising once means both see a well-formed PEM.
+  const normalisedPem = pem.replace(/\\n/g, "\n");
+
+  const privateKey = await importPKCS8(normalisedPem, "RS256");
 
   // Derive the public key explicitly rather than exporting the private one. exportJWK() on a
-  // private key returns the *private* JWK - d, p, q, dp, dq, qi - and the result of that is
-  // published at /.well-known/jwks.json, which handed the signing key to anyone who asked.
-  // Going through createPublicKey() means private material cannot reach the JWKS even if this
-  // code is changed later, rather than relying on someone remembering to strip fields.
-  const publicJwk = await exportJWK(createPublicKey(pem));
+  // private key returns the *private* JWK - d, p, q, dp, dq, qi - and that was being published
+  // at /.well-known/jwks.json, handing the signing key to anyone who asked for it.
+  const publicJwk = await exportJWK(createPublicKey(normalisedPem));
   const kid = await calculateJwkThumbprint(publicJwk);
   publicJwk.kid = kid;
   publicJwk.use = "sig";
@@ -153,9 +157,20 @@ export async function signLoreToken(params: {
   return { token, expiresAt };
 }
 
+/** Private JWK members, which must never appear in a published key set. */
+const PRIVATE_JWK_FIELDS = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"] as const;
+
 export async function getJwks(): Promise<{ keys: JWK[] }> {
   const { publicJwk } = await loadSigningKeys();
-  return { keys: [publicJwk] };
+
+  // Stripped again on the way out rather than trusted. This endpoint is public and
+  // unauthenticated, so the cost of a mistake here is the whole signing key; a redundant
+  // filter is worth more than the assumption that the derivation above stays correct.
+  const safe: JWK = { ...publicJwk };
+  for (const field of PRIVATE_JWK_FIELDS) {
+    delete (safe as unknown as Record<string, unknown>)[field];
+  }
+  return { keys: [safe] };
 }
 
 // Used by LookupUserPermissions to authenticate the caller: the CLI presents the
