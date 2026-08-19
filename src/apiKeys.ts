@@ -56,6 +56,9 @@ export function apiKeyMatches(presented: string, storedDigests: unknown): boolea
   if (digests.length === 0) return false;
 
   const candidate = createHash("sha256").update(presented, "utf8").digest();
+  // Every digest is checked even once one has matched. Returning early would make the
+  // response time depend on a key's position in the list, which over enough attempts
+  // reveals how many keys a user holds and roughly where a presented one sits among them.
   let matched = false;
   for (const digest of digests) {
     // Both are fixed-width SHA-256, so lengths always agree and timingSafeEqual cannot throw.
