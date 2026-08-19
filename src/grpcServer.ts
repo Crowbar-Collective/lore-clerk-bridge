@@ -10,7 +10,14 @@ import {
   loreServerEnv,
   type ResourceGrant,
 } from "./signing.js";
-import { getUserGrants, grantResource, revokeResource } from "./clerk.js";
+import {
+  ClerkUserNotFound,
+  getUserForApiKey,
+  getUserGrants,
+  grantResource,
+  revokeResource,
+} from "./clerk.js";
+import { apiKeyMatches, apiKeyUserId } from "./apiKeys.js";
 import {
   createRateLimiter,
   isTrustedPeer,
@@ -135,6 +142,11 @@ function healthCheck(
 // the rate at which they can churn it, so a flood cannot keep evicting real users'
 // pending logins.
 const sessionLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
+
+// Its own bucket rather than sharing sessionLimiter: this one guards a secret that can be
+// guessed, so it must not be possible to exhaust the budget for API key attempts by
+// spending it on harmless StartAuthSession calls, nor the reverse.
+const apiKeyLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
 
 // gRPC metadata is just HTTP/2 headers, so a proxy's X-Forwarded-For arrives here the
 // same way it does on the HTTP side. Trust it only from a private peer, for the reason
@@ -304,6 +316,118 @@ async function exchangeUserTokenForMultiresourceToken(
   }
 }
 
+// Long-lived API keys exist for clients that cannot complete a browser sign-in — CI agents
+// above all. A key names the Clerk user it belongs to and carries a secret half whose
+// SHA-256 is stored on that user in Clerk; see apiKeys.ts for the format and why the
+// digests live there rather than in this service's configuration.
+//
+// The key is only an identifier. Grants on the resulting token are read from the same
+// Clerk user, exactly as they are for an interactive login, so nothing in the request can
+// influence them. That is what keeps this from being the escalation described above
+// RebacApi: a caller cannot name the resources it wants, only prove which identity it is.
+//
+// The minted token keeps the ordinary short lifetime. The long-lived secret is the key,
+// revoked by removing its digest in Clerk — no restart and no redeploy.
+async function mintTokenForApiKey(
+  apiKey: string,
+  address: string
+): Promise<{ user_token: string; expires_at: number; user_id: string; user_name: string }> {
+  if (!apiKeyLimiter.check(address)) {
+    throw new RpcError(grpc.status.RESOURCE_EXHAUSTED, "Too many requests");
+  }
+
+  // Every rejection below is the same message. Distinguishing "no such user" from "wrong
+  // secret" would turn this into an oracle for which CI identities exist.
+  const invalid = new RpcError(grpc.status.UNAUTHENTICATED, "Invalid API key");
+
+  const claimedUserId = apiKeyUserId(apiKey);
+  if (!claimedUserId) {
+    console.warn(`API key exchange: malformed key from ${address}`);
+    throw invalid;
+  }
+
+  let identity;
+  try {
+    identity = await getUserForApiKey(claimedUserId);
+  } catch (err) {
+    if (err instanceof ClerkUserNotFound) {
+      console.warn(`API key exchange: key names unknown user ${claimedUserId}, from ${address}`);
+      throw invalid;
+    }
+    // Same reasoning as callerGrants: a Clerk outage must not read as "authorized for
+    // nothing", which would look like a legitimate denial.
+    throw new RpcError(
+      grpc.status.UNAVAILABLE,
+      `Could not load user from Clerk: ${(err as Error).message}`
+    );
+  }
+
+  if (!apiKeyMatches(apiKey, identity.apiKeyDigests)) {
+    console.warn(`API key exchange: no matching digest for ${claimedUserId}, from ${address}`);
+    throw invalid;
+  }
+
+  console.log(
+    `API key exchange: user=${identity.userId} resources=${identity.resources.length} from=${address}`
+  );
+
+  const { token: loreToken, expiresAt } = await signLoreToken({
+    userId: identity.userId,
+    userName: identity.userName,
+    issuer: requirePublicBaseUrl(),
+    audience: loreServerAudience(),
+    env: loreServerEnv(),
+    resources: identity.resources,
+  });
+
+  return {
+    user_token: loreToken,
+    expires_at: expiresAt,
+    user_id: identity.userId,
+    user_name: identity.userName,
+  };
+}
+
+// What `lore login --token-type api-key --token <key>` actually calls. Despite the name in
+// the proto, the CLI routes both "api-key" and "eg1" here rather than to
+// ExchangeAPIKeyForUserToken, so token_type is what distinguishes them.
+async function exchangeExternalTokenForUserToken(
+  call: grpc.ServerUnaryCall<{ external_token: string; token_type: string }, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callback: grpc.sendUnaryData<any>
+): Promise<void> {
+  try {
+    const tokenType = (call.request.token_type ?? "").trim().toLowerCase();
+    if (tokenType && tokenType !== "api-key") {
+      // "eg1" would be an Epic Games account token, which this bridge has no way to
+      // validate — Clerk is the only identity provider here.
+      throw new RpcError(
+        grpc.status.UNIMPLEMENTED,
+        `Unsupported token type "${tokenType}"; this bridge accepts "api-key"`
+      );
+    }
+    const token = await mintTokenForApiKey(call.request.external_token ?? "", callerAddress(call));
+    callback(null, { user_token: token });
+  } catch (err) {
+    failRpc("ExchangeExternalTokenForUserToken", callback, err);
+  }
+}
+
+// The proto's dedicated API key entry point. The current CLI does not use it, but other
+// clients may, and it costs one delegation to answer correctly rather than UNIMPLEMENTED.
+async function exchangeApiKeyForUserToken(
+  call: grpc.ServerUnaryCall<{ api_key: string }, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callback: grpc.sendUnaryData<any>
+): Promise<void> {
+  try {
+    const token = await mintTokenForApiKey(call.request.api_key ?? "", callerAddress(call));
+    callback(null, { user_token: token });
+  } catch (err) {
+    failRpc("ExchangeAPIKeyForUserToken", callback, err);
+  }
+}
+
 // Called by loreserver when a user creates a new repository (lore-server/src/grpc/
 // handlers/repository_create.rs), to register them as its owner. Clerk's publicMetadata
 // is the only place resource grants live, so "creating" a resource here means appending
@@ -381,6 +505,8 @@ export function createGrpcServer(): grpc.Server {
     LookupUserPermissions: lookupUserPermissions,
     CheckUserPermission: checkUserPermission,
     ExchangeUserTokenForMultiresourceToken: exchangeUserTokenForMultiresourceToken,
+    ExchangeExternalTokenForUserToken: exchangeExternalTokenForUserToken,
+    ExchangeAPIKeyForUserToken: exchangeApiKeyForUserToken,
   });
   return server;
 }

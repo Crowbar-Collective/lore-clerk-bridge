@@ -12,6 +12,9 @@ It implements Lore's `UrcAuthApi` gRPC service backed by a Clerk sign-in flow, s
 It ships as a single container and makes no assumptions about where it runs: any container host
 works, as long as it can satisfy the [networking requirements](#networking-requirements) below.
 
+Behaviour here was verified against **Lore 0.8.6**, and the pointers into Lore's own source are
+accurate as of that release. Later versions may move them.
+
 ## Quickstart
 
 Two hostnames pointed at one container, five variables, three settings on your Lore server.
@@ -24,7 +27,7 @@ Two hostnames pointed at one container, five variables, three settings on your L
 4. On the Lore server, set `JWT_ISSUER`, `JWK__ENDPOINT`, and `ENDPOINT__AUTH_URL` to point here.
 5. Grant a user a repository in Clerk's **public metadata**, then `lore auth login`.
 
-That is the whole happy path, and [Setup](#setup) walks through it. Everything after that section
+The [Setup](#setup) section walks through it. Everything after that section
 exists for the cases where your environment differs: a load balancer that already speaks gRPC, a
 platform that cannot expose ports 80 and 443, a Lore server on a different host.
 
@@ -33,10 +36,8 @@ platform that cannot expose ports 80 and 443, a Lore server on a different host.
 - A [Lore server](https://github.com/EpicGames/lore) already deployed (this bridge replaces its
   default auth, it doesn't replace the server itself).
 - A [Clerk](https://clerk.com) application, with a **custom primary domain** already verified
-  (Dashboard → Domains), not Clerk's default `*.accounts.dev` domain. Clerk's free Hobby plan
-  covers everything here: custom domains are included, and serving the bridge from a subdomain of
-  the primary domain is what avoids satellite domains, the one paid feature this would otherwise
-  need.
+  (Dashboard → Domains), not Clerk's default `*.accounts.dev` domain. The free Hobby plan covers
+  everything here.
 - Somewhere to run a container, satisfying the networking requirements below.
 - DNS you control for both hostnames, at any provider. If you use the bundled Caddy, the gRPC
   hostname also needs ports 80 and 443 reachable so Let's Encrypt can issue its certificate; see
@@ -187,6 +188,62 @@ each one, including the failure it prevents; this table is the index.
 | `LORE__SERVER__AUTH__JWK__ENDPOINT` | `<PUBLIC_HTTP_BASE_URL>/.well-known/jwks.json` |
 | `LORE__ENVIRONMENT__ENDPOINT__AUTH_URL` | `https://<GRPC_DOMAIN>`. The `https://` scheme is required; see [step 5](#5-point-your-lore-server-at-the-bridge) |
 
+## CI and other non-interactive clients
+
+`lore auth login` opens a browser, which a build agent cannot do. For those, the bridge
+accepts a long-lived **API key** and exchanges it for an ordinary short-lived Lore token:
+
+```bash
+lore login lore://your-server:41337 --token-type api-key --token <key>
+```
+
+This implements `UrcAuthApi.ExchangeExternalTokenForUserToken`, which is what the CLI calls
+for `--token-type api-key` despite the name; `ExchangeAPIKeyForUserToken` is wired to the
+same path for clients that use it. Without them the CLI fails with
+`The server does not implement the method ExchangeExternalTokenForUserToken`.
+
+### Issuing a key
+
+1. Create a **dedicated Clerk user** for the agent, not a person's account. Builds are then
+   attributed correctly, and revoking CI access never disturbs someone's login.
+2. Grant it repositories the usual way, in `publicMetadata.resources`.
+3. Generate a key:
+
+   ```bash
+   node scripts/generate-api-key.mjs user_2abcDEF...
+   ```
+
+4. Paste the printed digest into that user's **private** metadata:
+
+   ```json
+   { "loreApiKeyDigests": ["<digest>"] }
+   ```
+
+5. Store the key itself in your CI credential store. It is shown once; a lost key is
+   reissued, not recovered.
+
+Everything about a key lives on the Clerk user it belongs to, next to the
+grants it is paired with.
+
+### What a key is
+
+A key names a Clerk user; it does not carry permissions. The repositories on the issued token come
+from that user's `publicMetadata` at the moment of exchange, the same source read the same way as an
+interactive login, so a request can prove which identity it is but cannot ask for resources.
+
+Only a SHA-256 digest is stored, in `privateMetadata`, which is server-side only unlike the
+`publicMetadata` holding the grants. The key itself is shown once at generation; a lost key is
+reissued, not recovered.
+
+### Revoking and rotating
+
+Remove the digest from the user's `privateMetadata`. It takes effect on the next exchange. 
+To rotate without downtime, add the new digest to the array, move
+the agent over, then drop the old one.
+
+The **issued token keeps the ordinary one-hour lifetime**. The long-lived secret is the key,
+which is why a client should log in per run rather than caching the token.
+
 ## Networking requirements
 
 The container exposes three listeners: two public, one internal.
@@ -208,13 +265,10 @@ serves `GRPC_DOMAIN` on 443 and answers Let's Encrypt's HTTP-01 challenge on 80,
 own certificate with no DNS credentials and no plugin. This path needs `GRPC_DOMAIN` and a
 [persistent volume](#persistent-storage).
 
-If your platform cannot give you 80 and 443, and only offers a proxy on an arbitrary port, then
-neither HTTP-01 (needs 80) nor TLS-ALPN-01 (needs 443) can be solved and DNS-01 is the only option
-left. That costs a custom Caddy build and a DNS provider API token: set `CADDY_GRPC_PORT` to the
-port behind your proxy, add the plugin in the `Dockerfile`
-(`xcaddy build --with github.com/caddy-dns/cloudflare`, or [another provider](https://github.com/caddy-dns)),
-and add a matching `tls` block to the `Caddyfile`. Note the passthrough must be **L4/TCP**, since an
-L7 proxy that downgrades to HTTP/1.1 breaks native gRPC.
+If your platform only offers a proxy on an arbitrary port, neither challenge can be solved (HTTP-01
+needs 80, TLS-ALPN-01 needs 443) and DNS-01 is the only option. Set `CADDY_GRPC_PORT`, add a
+[caddy-dns plugin](https://github.com/caddy-dns) to the `Dockerfile`, and add a matching `tls` block
+to the `Caddyfile`. That passthrough must be L4/TCP; an L7 proxy breaks native gRPC.
 
 **Option B: your edge terminates TLS and speaks gRPC.** If your load balancer supports gRPC
 natively over end-to-end HTTP/2 (e.g. an AWS ALB gRPC target group with an ACM certificate), point
@@ -250,9 +304,7 @@ your Lore server, via `LORE_SERVER_IPS`:
 Leaving the default with a remote Lore server fails closed rather than open: `repository create`
 returns 403, instead of quietly leaving RebacApi reachable by any authenticated user.
 
-If you replace the bundled Caddy with your own edge, reproduce the same split. Note that Caddy
-reorders `handle` blocks by its own directive sorting, so use `route` when two matchers differ only
-by source address.
+If you replace the bundled Caddy with your own edge, reproduce the same split.
 
 ### Persistent storage
 
@@ -294,11 +346,6 @@ Cloudflare token is invalid or missing a permission. Verify it directly:
 If that's fine, check the token has **both** `Zone:Read` and `DNS:Edit`; one without the other
 fails with an authentication-looking error even though the real problem is scope.
 
-**Caddy's logs mention `acme-staging-v02.api.letsencrypt.org`.** Not itself the bug: Caddy falls
-back to Let's Encrypt's staging CA automatically after repeated failures, to avoid burning your
-production rate limit while you fix the real problem. Fix whatever's actually failing (see above)
-and it'll go back to issuing a production certificate.
-
 **Caddy's certificate cache resets on every deploy / Let's Encrypt rate limit
 (`too many certificates ... already issued for this exact set of identifiers`).** No persistent
 volume is mounted at `/data`; see [persistent storage](#persistent-storage). If you're already
@@ -322,21 +369,6 @@ any of those values. Set `LORE_SERVER_JWT_AUDIENCE` on the bridge to match. This
 `LORE_SERVER_HOSTNAME`; both end up in `aud` together, since the CLI's own local check and the
 server's `jwt_audience` check each require a different value there.
 
-**A change to token claims doesn't take effect: old behavior persists even after
-`lore auth login`.** The client caches tokens on disk in `tokens.toml` (under the per-user local
-config dir, e.g. `%LOCALAPPDATA%\Epic Games\lore\config\` on Windows, or wherever `LORE_AUTH_PATH`
-points). Crucially, **repository-scoped authz tokens are keyed `{auth_url}/{repository_id}`**, so
-`lore auth logout` against the *server* URL doesn't clear them, and `login` only refreshes the
-authn token. A still-valid cached authz token is reused without ever calling the auth service
-(`lore-transport/src/auth/exchange.rs` returns early on a cache hit), so the bridge sees no request
-at all. To force a clean exchange, delete `tokens.toml` or point the store somewhere fresh:
-
-```
-LORE_AUTH_PATH=/some/empty/dir
-```
-
-This only matters when token *contents* change; a normal deployment never hits it.
-
 ## How it works
 
 There are four flows:
@@ -354,9 +386,6 @@ There are four flows:
    any operation that connects to a *specific* repository (`clone`, `push`, `pull`, not just
    listing) has the client exchange its broad login token for one scoped to that repository
    before it can open storage/revision/lock connections (`lore-transport/src/auth/exchange.rs`).
-   Skipping this RPC doesn't break login or listing, but breaks every operation that actually
-   touches repository content, with a misleading `authorization header required` error that looks
-   like a missing-credential problem rather than a missing-RPC one.
 4. **Repository creation** (gRPC, `ucs.auth.RebacApi`): when a user creates a new repository, the
    Lore server calls back into a *different* gRPC service (`RebacApi.CreateResource`, not
    `UrcAuthApi`) to register them as its owner. Since Clerk's `publicMetadata` is the only place
@@ -419,31 +448,6 @@ request, so the bridge's hostname has to be in that list. Clerk recommends enabl
 in production, so this is worth setting up rather than avoiding; just remember to add
 `PUBLIC_HTTP_BASE_URL`'s hostname when you do.
 
-## Callback pages
-
-The browser-facing pages are plain static files under `public/`, with no server-side templating:
-
-```
-public/callback.html         served by GET /callback (behind the session guard)
-public/session-error.html    served by /login and /callback on an unknown/expired session
-public/assets/callback.js    the sign-in logic
-public/assets/styles.css     shared styling
-```
-
-Neither dynamic value needs to be interpolated into the markup: the session code is already in the
-query string, and the Clerk publishable key (public by design) comes from `GET /callback/config`.
-That keeps the HTML and JS editable as real files, and leaves no hand-rolled HTML escaping in the
-request path.
-
-`clerk-js` is **self-hosted** rather than loaded from a public CDN: this page reads the user's
-Clerk session, so it shouldn't depend on a third-party origin for the script that does it. It's
-served from the installed `@clerk/clerk-js` devDependency package under `/vendor/clerk`. The whole `dist`
-directory is exposed rather than the single entry file because `clerk.browser.js` is code-split and
-resolves its lazily-loaded chunks relative to its own script URL.
-
-Note that `tsc` only emits compiled TypeScript, so `public/` is copied into the image separately by
-the `Dockerfile`, the same way `proto/` is.
-
 ## Local development
 
 ```bash
@@ -453,6 +457,10 @@ cp .env.example .env   # fill in real values; SIGNING_KEY_PEM and the Caddy
                         # in production, plaintext gRPC works fine on localhost
 npm run dev
 ```
+
+The login pages under `public/` are plain static files; `npm run build` also vendors clerk-js's
+browser bundle into `public/vendor/clerk` so the package can stay a devDependency and be pruned
+from the image. `npm run dev` reads it from `node_modules` instead, so no build is needed first.
 
 `scripts/grpc-client-test.mjs` exercises the gRPC API directly against a locally running instance;
 `scripts/mint-test-token.mjs` mints a token without going through Clerk, useful for testing
