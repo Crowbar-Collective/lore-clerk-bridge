@@ -69,6 +69,27 @@ interface SigningKeys {
   kid: string;
 }
 
+/**
+ * Turns the single-line, backslash-n form the deployment supplies back into a real PEM.
+ * Left alone when it already contains real newlines, so a locally supplied key still works.
+ */
+function normalisePem(pem: string): string {
+  const ESCAPED_NEWLINE = String.fromCharCode(92) + "n";
+  return pem.includes(ESCAPED_NEWLINE) ? pem.split(ESCAPED_NEWLINE).join("\n") : pem;
+}
+
+/** Private JWK members, which must never appear in a published key set. */
+const PRIVATE_JWK_FIELDS = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"] as const;
+
+/** Returns a copy carrying only public key material. */
+function stripPrivateJwkFields(jwk: JWK): JWK {
+  const safe: JWK = { ...jwk };
+  for (const field of PRIVATE_JWK_FIELDS) {
+    delete (safe as unknown as Record<string, unknown>)[field];
+  }
+  return safe;
+}
+
 let cached: SigningKeys | null = null;
 
 // Lore server fetches/caches signing keys from our JWKS endpoint at startup and
@@ -92,8 +113,22 @@ async function loadSigningKeys(): Promise<SigningKeys> {
     pem = generated.privateKey;
   }
 
-  const privateKey = await importPKCS8(pem, "RS256");
-  const publicJwk = await exportJWK(privateKey);
+  // The deployed .env carries this PEM on a single line with literal backslash-n, because
+  // docker compose env files cannot hold embedded newlines (see scripts/start.sh in the
+  // lore-aws repo). Nothing accepts that form: jose's importPKCS8 fails it with
+  // ERR_OSSL_ASN1_HEADER_TOO_LONG, so it has to be turned back into a real PEM first.
+  //
+  // Only jose parses it after that. An earlier attempt to derive the public key with Node's
+  // createPublicKey failed too, because passing a PKCS8 *private* key as a string makes it
+  // decode as SPKI (ERR_OSSL_UNSUPPORTED). Both mistakes took the bridge down; there is
+  // deliberately one parser here, and it is the one already used to sign.
+  const privateKey = await importPKCS8(normalisePem(pem), "RS256");
+
+  // exportJWK() on a private key returns the *private* JWK, and this value is published at
+  // /.well-known/jwks.json - which is how the signing key came to be served publicly. The
+  // private members are removed here, and again in getJwks(), because the cost of getting
+  // this wrong is the entire signing key.
+  const publicJwk = stripPrivateJwkFields(await exportJWK(privateKey));
   const kid = await calculateJwkThumbprint(publicJwk);
   publicJwk.kid = kid;
   publicJwk.use = "sig";
@@ -149,7 +184,8 @@ export async function signLoreToken(params: {
 
 export async function getJwks(): Promise<{ keys: JWK[] }> {
   const { publicJwk } = await loadSigningKeys();
-  return { keys: [publicJwk] };
+  // Stripped again rather than trusted: this endpoint is public and unauthenticated.
+  return { keys: [stripPrivateJwkFields(publicJwk)] };
 }
 
 // Used by LookupUserPermissions to authenticate the caller: the CLI presents the
