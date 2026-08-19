@@ -1,4 +1,4 @@
-import { generateKeyPairSync } from "node:crypto";
+import { createPublicKey, generateKeyPairSync } from "node:crypto";
 import {
   SignJWT,
   jwtVerify,
@@ -93,7 +93,13 @@ async function loadSigningKeys(): Promise<SigningKeys> {
   }
 
   const privateKey = await importPKCS8(pem, "RS256");
-  const publicJwk = await exportJWK(privateKey);
+
+  // Derive the public key explicitly rather than exporting the private one. exportJWK() on a
+  // private key returns the *private* JWK - d, p, q, dp, dq, qi - and the result of that is
+  // published at /.well-known/jwks.json, which handed the signing key to anyone who asked.
+  // Going through createPublicKey() means private material cannot reach the JWKS even if this
+  // code is changed later, rather than relying on someone remembering to strip fields.
+  const publicJwk = await exportJWK(createPublicKey(pem));
   const kid = await calculateJwkThumbprint(publicJwk);
   publicJwk.kid = kid;
   publicJwk.use = "sig";
