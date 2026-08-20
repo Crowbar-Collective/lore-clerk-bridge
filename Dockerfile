@@ -5,6 +5,7 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
 COPY proto ./proto
+COPY scripts ./scripts
 # public/ is copied in before the build because `npm run build` vendors clerk-js's
 # browser files into public/vendor/clerk.
 COPY public ./public
