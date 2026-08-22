@@ -12,6 +12,7 @@ import {
 } from "./signing.js";
 import {
   ClerkUserNotFound,
+  getUserDisplayNames,
   getUserForApiKey,
   getUserGrants,
   grantResource,
@@ -147,6 +148,14 @@ const sessionLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
 // guessed, so it must not be possible to exhaust the budget for API key attempts by
 // spending it on harmless StartAuthSession calls, nor the reverse.
 const apiKeyLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
+
+// Its own bucket again: this one spends Clerk API quota per uncached id, and a caller
+// looping over ids should not be able to exhaust the login path for everyone else.
+const userInfoLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
+
+// A single request asking for thousands of ids would turn one RPC into thousands of Clerk
+// calls. Lore asks about the authors on a page of history, which is nowhere near this.
+const MAX_USER_INFO_IDS = 100;
 
 // gRPC metadata is just HTTP/2 headers, so a proxy's X-Forwarded-For arrives here the
 // same way it does on the HTTP side. Trust it only from a private peer, for the reason
@@ -498,6 +507,85 @@ async function deleteResource(
 // Public: the `lore` CLI has to reach this, so it is exposed through Caddy.
 export function createGrpcServer(): grpc.Server {
   const server = new grpc.Server();
+// Resolves user ids to display names, for `lore auth info` and anything built on it.
+// Without this, Lore falls back to showing the raw id: revision metadata records the
+// identity subject (user_...) rather than a name, deliberately, because a name captured
+// at commit time would be permanently wrong the moment someone changed it.
+//
+// Lore resolves its OWN user locally from the token's preferred_username claim and never
+// reaches this RPC, which is why a client logged in as the person it is asking about sees
+// a name whether or not this exists. Every other lookup - anyone reading someone else's
+// commits - lands here.
+//
+// Authorization: the caller must be authenticated, and when the request names a
+// resource_id it must be one the caller holds a grant for. That mirrors
+// CheckUserPermission rather than inventing a second rule. A request with no resource_id
+// is allowed on authentication alone: there is nothing to check it against, and the reply
+// discloses only display names for ids the caller could already read out of a repository
+// it has access to.
+async function getUserInfo(
+  call: grpc.ServerUnaryCall<{ resource_id?: string; user_id?: string[] }, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callback: grpc.sendUnaryData<any>
+): Promise<void> {
+  try {
+    const address = callerAddress(call);
+    if (!userInfoLimiter.check(address)) {
+      console.warn(`GetUserInfo: rate limited ${address}`);
+      callback({ code: grpc.status.RESOURCE_EXHAUSTED, message: "Too many requests" });
+      return;
+    }
+
+    const requested = call.request.user_id ?? [];
+    if (requested.length > MAX_USER_INFO_IDS) {
+      callback({
+        code: grpc.status.INVALID_ARGUMENT,
+        message: `At most ${MAX_USER_INFO_IDS} user ids per request, got ${requested.length}`,
+      });
+      return;
+    }
+
+    const { resources } = await callerGrants(call.metadata);
+    const resourceId = call.request.resource_id;
+
+    if (resourceId && !resources.some((r) => matchesResource(r.partition, resourceId))) {
+      console.warn(`GetUserInfo: caller not authorized for ${resourceId}`);
+      callback({ code: grpc.status.PERMISSION_DENIED, message: `Not authorized for: ${resourceId}` });
+      return;
+    }
+
+    if (requested.length === 0) {
+      callback(null, { user_info: [] });
+      return;
+    }
+
+    let names: Map<string, string>;
+    try {
+      names = await getUserDisplayNames(requested);
+    } catch (err) {
+      throw new RpcError(
+        grpc.status.UNAVAILABLE,
+        `Could not load user information from Clerk: ${(err as Error).message}`
+      );
+    }
+
+    console.log(
+      `GetUserInfo: resource=${JSON.stringify(resourceId)} requested=${requested.length} resolved=${names.size}`
+    );
+
+    // Unknown ids are simply absent from the reply. The client echoes back the id it
+    // asked with when it has no name for it, which is the behaviour we want anyway.
+    callback(null, {
+      user_info: [...names].map(([userId, displayName]) => ({
+        user_id: userId,
+        display_name: displayName,
+      })),
+    });
+  } catch (err) {
+    failRpc("GetUserInfo", callback, err);
+  }
+}
+
   server.addService(urcAuthApiService, {
     HealthCheck: healthCheck,
     StartAuthSession: startAuthSession,
@@ -507,6 +595,7 @@ export function createGrpcServer(): grpc.Server {
     ExchangeUserTokenForMultiresourceToken: exchangeUserTokenForMultiresourceToken,
     ExchangeExternalTokenForUserToken: exchangeExternalTokenForUserToken,
     ExchangeAPIKeyForUserToken: exchangeApiKeyForUserToken,
+    GetUserInfo: getUserInfo,
   });
   return server;
 }

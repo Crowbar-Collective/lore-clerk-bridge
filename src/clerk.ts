@@ -43,18 +43,86 @@ export async function verifyClerkSessionAndGetGrants(sessionToken: string): Prom
   return toUserGrant(await clerkClient.users.getUser(userId));
 }
 
+// The name a person is shown as, most recognisable first. Falling through to the raw id
+// is the last resort: it always identifies someone, it just reads badly.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function displayNameOf(user: any): string {
+  return (
+    user.username ||
+    [user.firstName, user.lastName].filter(Boolean).join(" ") ||
+    user.primaryEmailAddress?.emailAddress ||
+    user.id
+  );
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function toUserGrant(user: any): ClerkUserGrant {
   return {
     userId: user.id,
-    userName:
-      user.username ||
-      [user.firstName, user.lastName].filter(Boolean).join(" ") ||
-      user.primaryEmailAddress?.emailAddress ||
-      user.id,
+    userName: displayNameOf(user),
     resources: (user.publicMetadata?.resources as ResourceGrant[] | undefined) ?? [],
     apiKeyDigests: user.privateMetadata?.[DIGEST_FIELD],
   };
+}
+
+/** How long a resolved display name is reused before Clerk is asked again. */
+export const USER_INFO_TTL_MS = Number(process.env.USER_INFO_TTL_SECONDS ?? 300) * 1000;
+
+/** Ceiling on cached names, so the cache cannot become a leak. */
+const USER_INFO_CACHE_MAX = 5_000;
+
+const displayNames = new Map<string, { name: string; expiresAt: number }>();
+
+function pruneDisplayNames(now: number): void {
+  if (displayNames.size < USER_INFO_CACHE_MAX) return;
+  for (const [id, entry] of displayNames) {
+    if (entry.expiresAt <= now) displayNames.delete(id);
+  }
+  while (displayNames.size >= USER_INFO_CACHE_MAX) {
+    const oldest = displayNames.keys().next();
+    if (oldest.done) break;
+    displayNames.delete(oldest.value);
+  }
+}
+
+// Display names for user ids, cached because Lore resolves the same handful of authors
+// over and over - every commit announcement, every lock - and each miss spends Clerk API
+// quota. Names change rarely, so a few minutes of staleness costs nothing.
+//
+// A user Clerk does not know is omitted rather than reported: the caller asked about ids
+// it read out of revision metadata, and one belonging to a deleted account should not
+// fail the lookup for everyone else in the same batch. Any other Clerk failure throws, so
+// an outage surfaces as an outage instead of as "these people have no names" - the same
+// distinction getUserForApiKey draws.
+export async function getUserDisplayNames(userIds: string[]): Promise<Map<string, string>> {
+  const now = Date.now();
+  const resolved = new Map<string, string>();
+  const misses: string[] = [];
+
+  for (const userId of new Set(userIds)) {
+    const cached = displayNames.get(userId);
+    if (cached && cached.expiresAt > now) {
+      resolved.set(userId, cached.name);
+    } else {
+      misses.push(userId);
+    }
+  }
+
+  await Promise.all(
+    misses.map(async (userId) => {
+      try {
+        const name = displayNameOf(await clerkClient.users.getUser(userId));
+        pruneDisplayNames(now);
+        displayNames.set(userId, { name, expiresAt: now + USER_INFO_TTL_MS });
+        resolved.set(userId, name);
+      } catch (err) {
+        if ((err as { status?: number })?.status === 404) return;
+        throw err;
+      }
+    })
+  );
+
+  return resolved;
 }
 
 // Current grants for a user, straight from Clerk. The authorization RPCs use this rather
