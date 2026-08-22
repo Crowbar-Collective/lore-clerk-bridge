@@ -1,13 +1,15 @@
 import path from "node:path";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
-import { createSession, getSession } from "./sessionStore.js";
+import { createSession, deleteSession, getSession } from "./sessionStore.js";
 import {
   signLoreToken,
   verifyLoreToken,
   loreServerAudience,
   loreServerEnv,
+  loreTokenIssuer,
   type ResourceGrant,
 } from "./signing.js";
 import {
@@ -80,6 +82,44 @@ class RpcError extends Error {
   ) {
     super(message);
   }
+}
+
+// Compared as digests so the check is constant-time whatever the inputs: comparing the
+// strings directly would leak how much of a guessed client_state was right, and comparing
+// raw buffers would throw on a length mismatch, which leaks the length by itself.
+function secretEquals(a: string, b: string): boolean {
+  const left = createHash("sha256").update(a, "utf8").digest();
+  const right = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(left, right);
+}
+
+// A partition is a Lore repository ID - 32 hex characters, in every version we have seen.
+// This check exists for one specific value. A partition of "*" is our own convention for
+// "every repository" (see matchesResource), meant to be typed into the Clerk dashboard by
+// an administrator and never written by an RPC. Without this guard a single CreateResource
+// naming "*" turns the RebacApi escalation described above createRebacServer from "owner
+// on the one repository you can name" into "owner on all of them", which is a materially
+// worse outcome for the same mistake in network configuration.
+//
+// The accepted set is deliberately wider than 32 hex characters, so a Lore server using
+// some other ID format still works; what it cannot contain is anything matchesResource
+// treats as special, or the empty string.
+const PARTITION_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+function partitionFromResourceId(resourceId: unknown): string {
+  if (typeof resourceId !== "string") {
+    throw new RpcError(grpc.status.INVALID_ARGUMENT, "resource_id is required");
+  }
+  const partition = resourceId.replace(/^urc-/, "");
+  if (!PARTITION_PATTERN.test(partition)) {
+    // The offending value is not echoed back: it reaches this service from the network and
+    // failRpc puts the message straight into the log.
+    throw new RpcError(
+      grpc.status.INVALID_ARGUMENT,
+      "resource_id must be a repository id, optionally prefixed \"urc-\""
+    );
+  }
+  return partition;
 }
 
 // Authenticates the caller from its bearer token, then loads that user's *current* grants
@@ -202,7 +242,7 @@ function getAuthSession(
     callback({ code: grpc.status.NOT_FOUND, message: "Unknown or expired session_code" });
     return;
   }
-  if (record.clientState !== clientState) {
+  if (!secretEquals(record.clientState, clientState ?? "")) {
     callback({ code: grpc.status.PERMISSION_DENIED, message: "client_state does not match session" });
     return;
   }
@@ -211,12 +251,18 @@ function getAuthSession(
     return;
   }
 
+  // Read out before the session is dropped, and dropped before the reply goes out: the
+  // token is delivered exactly once, so a code that leaks afterwards is worth nothing.
+  // See deleteSession for the trade this makes.
+  const issued = record.userToken;
+  deleteSession(sessionCode);
+
   callback(null, {
     user_token: {
-      user_token: record.userToken.userToken,
-      expires_at: record.userToken.expiresAt,
-      user_id: record.userToken.userId,
-      user_name: record.userToken.userName,
+      user_token: issued.userToken,
+      expires_at: issued.expiresAt,
+      user_id: issued.userId,
+      user_name: issued.userName,
     },
   });
 }
@@ -311,7 +357,7 @@ async function exchangeUserTokenForMultiresourceToken(
     const { token: loreToken, expiresAt } = await signLoreToken({
       userId,
       userName,
-      issuer: requirePublicBaseUrl(),
+      issuer: loreTokenIssuer(),
       audience: loreServerAudience(),
       env: loreServerEnv(),
       resources,
@@ -383,7 +429,7 @@ async function mintTokenForApiKey(
   const { token: loreToken, expiresAt } = await signLoreToken({
     userId: identity.userId,
     userName: identity.userName,
-    issuer: requirePublicBaseUrl(),
+    issuer: loreTokenIssuer(),
     audience: loreServerAudience(),
     env: loreServerEnv(),
     resources: identity.resources,
@@ -448,7 +494,7 @@ async function createResource(
 ): Promise<void> {
   try {
     const { userId } = await callerIdentity(call.metadata);
-    const partition = call.request.resource_id.replace(/^urc-/, "");
+    const partition = partitionFromResourceId(call.request.resource_id);
 
     let created: boolean;
     try {
@@ -486,7 +532,9 @@ async function deleteResource(
 ): Promise<void> {
   try {
     const { userId } = await callerIdentity(call.metadata);
-    const partition = call.request.resource_id.replace(/^urc-/, "");
+    // Validated on the same terms as CreateResource, so the two agree on what a
+    // resource_id is rather than each having its own idea.
+    const partition = partitionFromResourceId(call.request.resource_id);
 
     try {
       await revokeResource(userId, partition);

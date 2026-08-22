@@ -313,6 +313,12 @@ Only needed for option A. Caddy stores its ACME account and certificates under `
 container filesystem means every redeploy requests a brand-new certificate, and Let's Encrypt's
 duplicate-certificate limit (5 per exact hostname set per week) is reached quickly.
 
+The container runs as the unprivileged `node` user (uid 1000), so `/data` has to be writable by
+it. A **named volume** inherits the ownership already set on `/data` in the image and needs
+nothing further. A **bind mount** takes its ownership from the host instead: `chown 1000:1000`
+the host directory, or Caddy cannot write its certificate and falls back to reissuing on every
+start.
+
 ## Troubleshooting
 
 **Crash loop with `EADDRINUSE` on startup.** `PORT` and `GRPC_PORT` (or `CADDY_GRPC_PORT`) resolved

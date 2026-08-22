@@ -27,6 +27,15 @@ export function loreServerAudience(): string[] {
   return [hostname, process.env.LORE_SERVER_JWT_AUDIENCE ?? "lore-service"];
 }
 
+// The `iss` on every token this bridge mints, and the value verifyLoreToken requires to
+// be present. Both mint paths (interactive login, API key exchange) read it from here so
+// the two cannot drift apart from what verification expects.
+export function loreTokenIssuer(): string {
+  const url = process.env.PUBLIC_HTTP_BASE_URL;
+  if (!url) throw new Error("PUBLIC_HTTP_BASE_URL is required");
+  return url.endsWith("/") ? url.slice(0, -1) : url;
+}
+
 // Must match the Lore server's own --env / LORE_ENV (default "local") — required on the
 // JWT independently of anything this bridge validates.
 export function loreServerEnv(): string {
@@ -196,7 +205,16 @@ export async function verifyLoreToken(
 ): Promise<{ sub: string; name: string; resources: ResourceGrant[] }> {
   const { publicJwk } = await loadSigningKeys();
   const publicKey = await importJWK(publicJwk, "RS256");
-  const { payload } = await jwtVerify(token, publicKey);
+  // alg, iss and aud are all pinned rather than left to the defaults. None of them is
+  // load-bearing today - forging a token still needs the private key, and this bridge is
+  // the only thing that signs with it - but the checks cost nothing and they mean a token
+  // minted for some other audience, or by a differently-configured deployment sharing the
+  // key, is rejected here instead of being accepted on its signature alone.
+  const { payload } = await jwtVerify(token, publicKey, {
+    algorithms: ["RS256"],
+    issuer: loreTokenIssuer(),
+    audience: loreServerAudience(),
+  });
   return {
     sub: payload.sub ?? "",
     name: (payload.name as string | undefined) ?? "",

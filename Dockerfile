@@ -32,6 +32,21 @@ COPY Caddyfile ./Caddyfile
 COPY start.sh ./start.sh
 RUN chmod +x start.sh
 
+# Neither process needs root. Caddy still has to bind 80 and 443 - for the ACME HTTP-01
+# challenge and for TLS - which a non-root process cannot do without this capability.
+# File capabilities live in extended attributes and are not carried across COPY --from,
+# so it is granted here rather than inherited from the caddy image. libcap is removed
+# again once setcap has run: the capability is on the binary, not in the package.
+RUN apk add --no-cache libcap \
+    && setcap cap_net_bind_service=+ep /usr/bin/caddy \
+    && apk del libcap
+# Caddy's certificate cache (XDG_DATA_HOME below) has to be writable by that user, and
+# the directory has to exist beforehand so a named volume mounted here inherits its
+# ownership. A bind mount does not: point one here and it must already be writable by
+# uid 1000, or Caddy cannot persist its certificate.
+RUN mkdir -p /data && chown node:node /data
+USER node
+
 ENV NODE_ENV=production
 # Caddy caches its ACME account and certificates under $XDG_DATA_HOME/caddy. Container
 # filesystems are typically ephemeral across deploys, so without a persistent volume
