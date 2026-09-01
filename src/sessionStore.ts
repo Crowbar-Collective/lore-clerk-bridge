@@ -58,9 +58,27 @@ export function getSession(sessionCode: string): SessionRecord | undefined {
 export function completeSession(sessionCode: string, userToken: IssuedUserToken): boolean {
   const record = getSession(sessionCode);
   if (!record) return false;
+  // A session is completed once. Without this, anyone who learns a session code could
+  // overwrite a finished login with a token minted for their own Clerk account, and the
+  // CLI that started the session would come back holding the attacker's identity rather
+  // than the user's - authenticated as the wrong person, with the wrong grants.
+  if (record.status === "complete") return false;
   record.status = "complete";
   record.userToken = userToken;
   return true;
+}
+
+/**
+ * Drops a session once its token has been handed to the client that started it.
+ *
+ * <p>The token is the entire value of a session, so leaving it readable for the rest of
+ * the five-minute TTL means anyone who later learns the code - from browser history, a
+ * proxy log, a shared screen - can still collect it. Delivering it exactly once is the
+ * same trade an OAuth authorization code makes: a client that loses the response starts
+ * a new login rather than polling again.
+ */
+export function deleteSession(sessionCode: string): void {
+  sessions.delete(sessionCode);
 }
 
 function sweepExpiredSessions(): void {

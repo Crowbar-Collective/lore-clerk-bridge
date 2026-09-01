@@ -1,17 +1,20 @@
 import path from "node:path";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
-import { createSession, getSession } from "./sessionStore.js";
+import { createSession, deleteSession, getSession } from "./sessionStore.js";
 import {
   signLoreToken,
   verifyLoreToken,
   loreServerAudience,
   loreServerEnv,
+  loreTokenIssuer,
   type ResourceGrant,
 } from "./signing.js";
 import {
   ClerkUserNotFound,
+  getUserDisplayNames,
   getUserForApiKey,
   getUserGrants,
   grantResource,
@@ -81,6 +84,44 @@ class RpcError extends Error {
   }
 }
 
+// Compared as digests so the check is constant-time whatever the inputs: comparing the
+// strings directly would leak how much of a guessed client_state was right, and comparing
+// raw buffers would throw on a length mismatch, which leaks the length by itself.
+function secretEquals(a: string, b: string): boolean {
+  const left = createHash("sha256").update(a, "utf8").digest();
+  const right = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(left, right);
+}
+
+// A partition is a Lore repository ID - 32 hex characters, in every version we have seen.
+// This check exists for one specific value. A partition of "*" is our own convention for
+// "every repository" (see matchesResource), meant to be typed into the Clerk dashboard by
+// an administrator and never written by an RPC. Without this guard a single CreateResource
+// naming "*" turns the RebacApi escalation described above createRebacServer from "owner
+// on the one repository you can name" into "owner on all of them", which is a materially
+// worse outcome for the same mistake in network configuration.
+//
+// The accepted set is deliberately wider than 32 hex characters, so a Lore server using
+// some other ID format still works; what it cannot contain is anything matchesResource
+// treats as special, or the empty string.
+const PARTITION_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+function partitionFromResourceId(resourceId: unknown): string {
+  if (typeof resourceId !== "string") {
+    throw new RpcError(grpc.status.INVALID_ARGUMENT, "resource_id is required");
+  }
+  const partition = resourceId.replace(/^urc-/, "");
+  if (!PARTITION_PATTERN.test(partition)) {
+    // The offending value is not echoed back: it reaches this service from the network and
+    // failRpc puts the message straight into the log.
+    throw new RpcError(
+      grpc.status.INVALID_ARGUMENT,
+      "resource_id must be a repository id, optionally prefixed \"urc-\""
+    );
+  }
+  return partition;
+}
+
 // Authenticates the caller from its bearer token, then loads that user's *current* grants
 // from Clerk. Deliberately not `verifyLoreToken(token).resources`: the token's claim is a
 // snapshot from login, so a repository created afterwards (or a grant added or revoked in
@@ -148,6 +189,14 @@ const sessionLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
 // spending it on harmless StartAuthSession calls, nor the reverse.
 const apiKeyLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
 
+// Its own bucket again: this one spends Clerk API quota per uncached id, and a caller
+// looping over ids should not be able to exhaust the login path for everyone else.
+const userInfoLimiter = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
+
+// A single request asking for thousands of ids would turn one RPC into thousands of Clerk
+// calls. Lore asks about the authors on a page of history, which is nowhere near this.
+const MAX_USER_INFO_IDS = 100;
+
 // gRPC metadata is just HTTP/2 headers, so a proxy's X-Forwarded-For arrives here the
 // same way it does on the HTTP side. Trust it only from a private peer, for the reason
 // given in rateLimit.ts; otherwise every request behind the proxy shares one bucket and
@@ -193,7 +242,7 @@ function getAuthSession(
     callback({ code: grpc.status.NOT_FOUND, message: "Unknown or expired session_code" });
     return;
   }
-  if (record.clientState !== clientState) {
+  if (!secretEquals(record.clientState, clientState ?? "")) {
     callback({ code: grpc.status.PERMISSION_DENIED, message: "client_state does not match session" });
     return;
   }
@@ -202,12 +251,18 @@ function getAuthSession(
     return;
   }
 
+  // Read out before the session is dropped, and dropped before the reply goes out: the
+  // token is delivered exactly once, so a code that leaks afterwards is worth nothing.
+  // See deleteSession for the trade this makes.
+  const issued = record.userToken;
+  deleteSession(sessionCode);
+
   callback(null, {
     user_token: {
-      user_token: record.userToken.userToken,
-      expires_at: record.userToken.expiresAt,
-      user_id: record.userToken.userId,
-      user_name: record.userToken.userName,
+      user_token: issued.userToken,
+      expires_at: issued.expiresAt,
+      user_id: issued.userId,
+      user_name: issued.userName,
     },
   });
 }
@@ -302,7 +357,7 @@ async function exchangeUserTokenForMultiresourceToken(
     const { token: loreToken, expiresAt } = await signLoreToken({
       userId,
       userName,
-      issuer: requirePublicBaseUrl(),
+      issuer: loreTokenIssuer(),
       audience: loreServerAudience(),
       env: loreServerEnv(),
       resources,
@@ -374,7 +429,7 @@ async function mintTokenForApiKey(
   const { token: loreToken, expiresAt } = await signLoreToken({
     userId: identity.userId,
     userName: identity.userName,
-    issuer: requirePublicBaseUrl(),
+    issuer: loreTokenIssuer(),
     audience: loreServerAudience(),
     env: loreServerEnv(),
     resources: identity.resources,
@@ -439,7 +494,7 @@ async function createResource(
 ): Promise<void> {
   try {
     const { userId } = await callerIdentity(call.metadata);
-    const partition = call.request.resource_id.replace(/^urc-/, "");
+    const partition = partitionFromResourceId(call.request.resource_id);
 
     let created: boolean;
     try {
@@ -477,7 +532,9 @@ async function deleteResource(
 ): Promise<void> {
   try {
     const { userId } = await callerIdentity(call.metadata);
-    const partition = call.request.resource_id.replace(/^urc-/, "");
+    // Validated on the same terms as CreateResource, so the two agree on what a
+    // resource_id is rather than each having its own idea.
+    const partition = partitionFromResourceId(call.request.resource_id);
 
     try {
       await revokeResource(userId, partition);
@@ -498,6 +555,85 @@ async function deleteResource(
 // Public: the `lore` CLI has to reach this, so it is exposed through Caddy.
 export function createGrpcServer(): grpc.Server {
   const server = new grpc.Server();
+// Resolves user ids to display names, for `lore auth info` and anything built on it.
+// Without this, Lore falls back to showing the raw id: revision metadata records the
+// identity subject (user_...) rather than a name, deliberately, because a name captured
+// at commit time would be permanently wrong the moment someone changed it.
+//
+// Lore resolves its OWN user locally from the token's preferred_username claim and never
+// reaches this RPC, which is why a client logged in as the person it is asking about sees
+// a name whether or not this exists. Every other lookup - anyone reading someone else's
+// commits - lands here.
+//
+// Authorization: the caller must be authenticated, and when the request names a
+// resource_id it must be one the caller holds a grant for. That mirrors
+// CheckUserPermission rather than inventing a second rule. A request with no resource_id
+// is allowed on authentication alone: there is nothing to check it against, and the reply
+// discloses only display names for ids the caller could already read out of a repository
+// it has access to.
+async function getUserInfo(
+  call: grpc.ServerUnaryCall<{ resource_id?: string; user_id?: string[] }, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callback: grpc.sendUnaryData<any>
+): Promise<void> {
+  try {
+    const address = callerAddress(call);
+    if (!userInfoLimiter.check(address)) {
+      console.warn(`GetUserInfo: rate limited ${address}`);
+      callback({ code: grpc.status.RESOURCE_EXHAUSTED, message: "Too many requests" });
+      return;
+    }
+
+    const requested = call.request.user_id ?? [];
+    if (requested.length > MAX_USER_INFO_IDS) {
+      callback({
+        code: grpc.status.INVALID_ARGUMENT,
+        message: `At most ${MAX_USER_INFO_IDS} user ids per request, got ${requested.length}`,
+      });
+      return;
+    }
+
+    const { resources } = await callerGrants(call.metadata);
+    const resourceId = call.request.resource_id;
+
+    if (resourceId && !resources.some((r) => matchesResource(r.partition, resourceId))) {
+      console.warn(`GetUserInfo: caller not authorized for ${resourceId}`);
+      callback({ code: grpc.status.PERMISSION_DENIED, message: `Not authorized for: ${resourceId}` });
+      return;
+    }
+
+    if (requested.length === 0) {
+      callback(null, { user_info: [] });
+      return;
+    }
+
+    let names: Map<string, string>;
+    try {
+      names = await getUserDisplayNames(requested);
+    } catch (err) {
+      throw new RpcError(
+        grpc.status.UNAVAILABLE,
+        `Could not load user information from Clerk: ${(err as Error).message}`
+      );
+    }
+
+    console.log(
+      `GetUserInfo: resource=${JSON.stringify(resourceId)} requested=${requested.length} resolved=${names.size}`
+    );
+
+    // Unknown ids are simply absent from the reply. The client echoes back the id it
+    // asked with when it has no name for it, which is the behaviour we want anyway.
+    callback(null, {
+      user_info: [...names].map(([userId, displayName]) => ({
+        user_id: userId,
+        display_name: displayName,
+      })),
+    });
+  } catch (err) {
+    failRpc("GetUserInfo", callback, err);
+  }
+}
+
   server.addService(urcAuthApiService, {
     HealthCheck: healthCheck,
     StartAuthSession: startAuthSession,
@@ -507,6 +643,7 @@ export function createGrpcServer(): grpc.Server {
     ExchangeUserTokenForMultiresourceToken: exchangeUserTokenForMultiresourceToken,
     ExchangeExternalTokenForUserToken: exchangeExternalTokenForUserToken,
     ExchangeAPIKeyForUserToken: exchangeApiKeyForUserToken,
+    GetUserInfo: getUserInfo,
   });
   return server;
 }

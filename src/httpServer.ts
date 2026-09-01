@@ -4,7 +4,13 @@ import { fileURLToPath } from "node:url";
 import express, { type Express, type Response } from "express";
 import { getSession, completeSession } from "./sessionStore.js";
 import { verifyClerkSessionAndGetGrants } from "./clerk.js";
-import { signLoreToken, getJwks, loreServerAudience, loreServerEnv } from "./signing.js";
+import {
+  signLoreToken,
+  getJwks,
+  loreServerAudience,
+  loreServerEnv,
+  loreTokenIssuer,
+} from "./signing.js";
 import { createRateLimiter, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS } from "./rateLimit.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -48,6 +54,27 @@ export function createHttpApp(): Express {
   // forwarded address is meaningful; a request straight off the internet can claim any
   // address it likes and is rate-limited by the address it actually came from.
   app.set("trust proxy", ["loopback", "linklocal", "uniquelocal"]);
+  app.disable("x-powered-by");
+
+  // Applied to every response rather than only the two HTML pages: nosniff is worth having
+  // on the JSON endpoints too, and one middleware is easier to keep honest than three.
+  //
+  // Deliberately no script-src/connect-src policy. clerk-js talks to a Clerk Frontend API
+  // origin derived from the publishable key, so the correct value differs per deployment
+  // and a wrong one breaks sign-in outright rather than failing visibly. frame-ancestors
+  // is the directive carrying the security value here - it is what stops /callback being
+  // framed by another site - and unlike the rest it is deployment-independent.
+  app.use((_req, res, next) => {
+    res.set("Content-Security-Policy", "frame-ancestors 'none'");
+    res.set("X-Frame-Options", "DENY");
+    res.set("X-Content-Type-Options", "nosniff");
+    res.set("Referrer-Policy", "no-referrer");
+    // Browsers ignore this when it arrives over plain HTTP (RFC 6797), so it is safe for
+    // local development. No includeSubDomains: this service is deployed on a subdomain of
+    // the Clerk primary domain, and that directive would reach across to its siblings.
+    res.set("Strict-Transport-Security", "max-age=31536000");
+    next();
+  });
 
   app.use("/assets", express.static(path.join(PUBLIC_DIR, "assets")));
   app.use("/vendor/clerk", express.static(CLERK_DIST_DIR));
@@ -114,15 +141,24 @@ export function createHttpApp(): Express {
       const { token: loreToken, expiresAt } = await signLoreToken({
         userId,
         userName,
-        issuer: requireEnv("PUBLIC_HTTP_BASE_URL"),
+        issuer: loreTokenIssuer(),
         audience: loreServerAudience(),
         env: loreServerEnv(),
         resources,
       });
-      completeSession(sessionCode, { userToken: loreToken, expiresAt, userId, userName });
+      // Refused rather than overwritten when the session is already complete; see
+      // completeSession. Reported as a conflict so the page says something truthful
+      // rather than claiming a sign-in that did not take effect.
+      if (!completeSession(sessionCode, { userToken: loreToken, expiresAt, userId, userName })) {
+        res.status(409).json({ error: "This login session has already been completed" });
+        return;
+      }
       res.json({ ok: true });
     } catch (err) {
-      res.status(401).json({ error: `Clerk verification failed: ${(err as Error).message}` });
+      // The detail goes to the log rather than the response: it comes from Clerk and can
+      // name internal specifics, and the browser cannot act on it either way.
+      console.warn(`/callback/complete: Clerk verification failed: ${(err as Error).message}`);
+      res.status(401).json({ error: "Clerk verification failed" });
     }
   });
 
