@@ -7,6 +7,7 @@ import { createSession, deleteSession, getSession } from "./sessionStore.js";
 import {
   signLoreToken,
   verifyLoreToken,
+  verifyRefreshableLoreToken,
   loreServerAudience,
   loreServerEnv,
   loreTokenIssuer,
@@ -377,6 +378,86 @@ async function exchangeUserTokenForMultiresourceToken(
 // digests live there rather than in this service's configuration.
 //
 // The key is only an identifier. Grants on the resulting token are read from the same
+// How long after expiry a token can still be exchanged for a fresh one. Seven days keeps
+// a laptop that was closed over a long weekend from forcing a browser login, while still
+// bounding how long a leaked token stays useful. Beyond it, log in again.
+const REFRESH_GRACE_SECONDS = Number(process.env.REFRESH_GRACE_SECONDS ?? 7 * 24 * 60 * 60);
+
+// Renew an expired (or nearly expired) token without sending the user back through the
+// browser. Declared in the proto from the start; implementing it late is what caused a
+// confusing failure in Lore Desktop.
+//
+// Tokens carry a one-hour TTL and Desktop is a long-running process. With this RPC
+// unimplemented, grpc-js answered UNIMPLEMENTED, the client gave up on the identity
+// ("Skipping identity <user>, authn token is expired") and every later call went out
+// unauthenticated - surfacing as "Not authorized to access repository" even immediately
+// after a *successful* browser login, because the newly minted token was written to the
+// token store but never re-read by the already-running process. Restarting the client
+// appeared to fix it, which pointed away from the real cause. The CLI never showed it at
+// all: a fresh process per invocation always reads the store.
+async function refreshAuthSession(
+  call: grpc.ServerUnaryCall<Record<string, never>, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callback: grpc.sendUnaryData<any>
+): Promise<void> {
+  try {
+    const presented = extractBearerToken(call.metadata);
+    if (!presented) {
+      throw new RpcError(grpc.status.UNAUTHENTICATED, "Missing bearer token");
+    }
+
+    let identity;
+    try {
+      identity = await verifyRefreshableLoreToken(presented, REFRESH_GRACE_SECONDS);
+    } catch {
+      // Deliberately one message for every rejection - expired beyond the window, wrong
+      // issuer, bad signature. The client's only useful response to any of them is the
+      // same, and distinguishing them tells an attacker which part they got right.
+      throw new RpcError(
+        grpc.status.UNAUTHENTICATED,
+        "Token cannot be refreshed; log in again"
+      );
+    }
+
+    // Grants are re-read from Clerk rather than copied across from the presented token, so
+    // a permission granted or revoked since the original login takes effect on the next
+    // refresh instead of persisting until the user happens to log out. Same reasoning as
+    // callerGrants: a Clerk outage must fail loudly rather than read as "authorized for
+    // nothing", which would look like a legitimate denial.
+    let resources;
+    try {
+      resources = await getUserGrants(identity.sub);
+    } catch (err) {
+      throw new RpcError(
+        grpc.status.UNAVAILABLE,
+        `Could not load permissions from Clerk: ${(err as Error).message}`
+      );
+    }
+
+    const { token, expiresAt } = await signLoreToken({
+      userId: identity.sub,
+      userName: identity.name,
+      issuer: loreTokenIssuer(),
+      audience: loreServerAudience(),
+      env: loreServerEnv(),
+      resources,
+    });
+
+    console.log(`RefreshAuthSession: user=${identity.sub} resources=${resources.length}`);
+
+    callback(null, {
+      user_token: {
+        user_token: token,
+        expires_at: expiresAt,
+        user_id: identity.sub,
+        user_name: identity.name,
+      },
+    });
+  } catch (err) {
+    failRpc("RefreshAuthSession", callback, err);
+  }
+}
+
 // Clerk user, exactly as they are for an interactive login, so nothing in the request can
 // influence them. That is what keeps this from being the escalation described above
 // RebacApi: a caller cannot name the resources it wants, only prove which identity it is.
@@ -638,6 +719,7 @@ async function getUserInfo(
     HealthCheck: healthCheck,
     StartAuthSession: startAuthSession,
     GetAuthSession: getAuthSession,
+    RefreshAuthSession: refreshAuthSession,
     LookupUserPermissions: lookupUserPermissions,
     CheckUserPermission: checkUserPermission,
     ExchangeUserTokenForMultiresourceToken: exchangeUserTokenForMultiresourceToken,

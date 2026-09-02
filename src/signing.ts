@@ -203,6 +203,30 @@ export async function getJwks(): Promise<{ keys: JWK[] }> {
 export async function verifyLoreToken(
   token: string
 ): Promise<{ sub: string; name: string; resources: ResourceGrant[] }> {
+  return verifyLoreTokenInternal(token, 0);
+}
+
+// Same verification, but tolerating a token that has already expired.
+//
+// RefreshAuthSession exists precisely to renew an expired token, so expiry cannot be
+// disqualifying there. Everything else still is: signature, issuer and audience are
+// checked exactly as above, so only a token this bridge actually minted is refreshable.
+//
+// The window is bounded rather than unlimited. Without a bound, a token captured once
+// could be renewed forever and the one-hour TTL would stop meaning anything; past the
+// window the user logs in again. jose applies clockTolerance to exp, so a grace period
+// is expressed directly rather than by parsing and re-checking claims by hand.
+export async function verifyRefreshableLoreToken(
+  token: string,
+  graceSeconds: number
+): Promise<{ sub: string; name: string; resources: ResourceGrant[] }> {
+  return verifyLoreTokenInternal(token, graceSeconds);
+}
+
+async function verifyLoreTokenInternal(
+  token: string,
+  clockToleranceSeconds: number
+): Promise<{ sub: string; name: string; resources: ResourceGrant[] }> {
   const { publicJwk } = await loadSigningKeys();
   const publicKey = await importJWK(publicJwk, "RS256");
   // alg, iss and aud are all pinned rather than left to the defaults. None of them is
@@ -214,6 +238,9 @@ export async function verifyLoreToken(
     algorithms: ["RS256"],
     issuer: loreTokenIssuer(),
     audience: loreServerAudience(),
+    // 0 for ordinary verification, which is jose's default and preserves the previous
+    // behaviour exactly. Non-zero only on the refresh path.
+    clockTolerance: clockToleranceSeconds,
   });
   return {
     sub: payload.sub ?? "",
